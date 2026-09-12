@@ -1,0 +1,9 @@
+numpy
+netCDF4
+s3fs
+botocore
+matplotlib
+cartopy
+Pillow
+imageio
+imageio-ffmpeg

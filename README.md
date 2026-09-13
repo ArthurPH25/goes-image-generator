@@ -1,110 +1,81 @@
-# GOES Satellite Image Generator
+# GOES Image Generator
 
-Gerador de imagens e vídeos de satélite a partir de dados brutos GOES-16/GOES-19 (NOAA), com foco em cobertura da **América do Sul**. Renderiza qualquer uma das 16 bandas espectrais do instrumento ABI e o mapeador de raios GLM, com paletas de cores, projeção cartográfica e estilo de saída totalmente configuráveis.
+Gerador de imagens e vídeos de alta precisão a partir de dados brutos dos satélites GOES-16 e GOES-19 (NOAA), totalmente otimizado para a **América do Sul**. Renderiza todas as 16 bandas espectrais do sensor ABI e o mapeador de raios GLM com suporte a colormaps, projeção cartográfica e estilização 100% customizáveis.
+
+---
 
 ## Visão Geral
 
-O projeto baixa arquivos NetCDF diretamente do bucket público S3 da NOAA (`noaa-goes16` / `noaa-goes19`), recorta espacialmente os dados para a região de interesse, aplica a paleta de cores correspondente ao canal e renderiza o resultado com `matplotlib` + `cartopy`. A saída pode ser uma imagem única (`.png`) ou um vídeo (`.mp4`, montado via `ffmpeg` a partir de uma sequência de frames).
+O script pega os arquivos NetCDF direto do bucket público S3 da NOAA (`noaa-goes16` / `noaa-goes19`), faz o recorte geográfico da região escolhida, aplica a paleta de cores correspondente e renderiza tudo usando `matplotlib` + `cartopy`.
 
-### Arquitetura
+A saída pode ser uma imagem avulsa em PNG ou um vídeo em MP4 (costurado via `ffmpeg` a partir da sequência de frames).
 
-O fluxo de execução é orquestrado por `index.py`:
+### Arquitetura do Sistema
 
-1. **Validação de configuração:** `config.ini` e `colors.ini` são lidos e validados de forma estrita antes de qualquer processamento (sem valores padrão implícitos; chave ausente ou malformada interrompe a execução).
-2. **Descoberta de arquivos:** para cada timestamp alvo, o bucket S3 correspondente ao satélite ativo naquele período (GOES-16 até 07/04/2025, GOES-19 depois) é listado via `s3fs` para localizar o arquivo NetCDF do canal solicitado.
-3. **Download concorrente:** `S3_downloader.py` baixa os arquivos de forma assíncrona (`asyncio` + `s3fs`), com retry exponencial, validação de integridade do NetCDF e tratamento diferenciado de erros transitórios vs. definitivos (404).
-4. **Processamento e renderização:** dividido em dois módulos especializados:
-   - `goes_bands.py`: extrai e renderiza qualquer uma das bandas ABI (canais 1–16), aplicando recorte geográfico, colormap (refletância em escala de cinza ou paleta térmica customizada) e overlay de mapa.
-   - `GLM.py`: processa dados de densidade de raios do GLM, com suporte a rastro histórico configurável (idade do raio codificada em cor e tamanho do marcador) e composição opcional sobre uma banda ABI de fundo (com cache compartilhado entre frames de um mesmo vídeo).
-5. **Paralelização:** múltiplos frames são processados simultaneamente via `ProcessPoolExecutor` (paralelismo de CPU), enquanto os downloads de cada frame usam concorrência assíncrona internamente (paralelismo de I/O).
-6. **Montagem de vídeo:** quando `generation_type = V`, os frames gerados são costurados em `.mp4` via `imageio`/`ffmpeg`, com controle de bitrate (CRF), preset de compressão e escala de saída.
+A orquestração principal roda em `index.py`:
 
-`utils.py` concentra as funções compartilhadas entre os módulos: parsing e validação de configuração, geometria de projeção geoestacionária, recorte de área, composição dos eixos do mapa, título, marca d'água e persistência do cache de fundo do GLM (com lock de arquivo para evitar reprocessamento concorrente do mesmo frame por workers diferentes).
+1. **Validação:** `config.ini` (seções `[GENERAL]`, `[IMAGE_TIME]` / `[VIDEO_TIME]`) e o canal são parseados e validados logo na arrancada. Esqueceu uma chave básica ou digitou horário errado? O script capota imediatamente antes de baixar qualquer coisa. *(Nota: validações de mapa, estilo e cores rodam no worker no início da renderização).*
+2. **Pegando os Arquivos no S3:** Localização dos arquivos NetCDF no bucket correspondente. O script alterna automaticamente entre satélites: **GOES-16** até 07/04/2025 e **GOES-19** para datas posteriores.
+3. **Download Assíncrono Concorrente:** `S3_downloader.py` baixa a parada usando `asyncio` + `s3fs`, com retry exponencial, checagem de integridade e tratamento pra não travar em erro 404 de imagem que não existe no bucket.
+4. **Processamento e Renderização:**
+   - `goes_bands.py`: cuida das 16 bandas ABI (refletância em cinza ou paleta térmica customizada) com recorte de mapa e overlays.
+   - `GLM.py`: processa a densidade de raios do GLM, com rastro histórico (idade codificada por cor e tamanho de marcador) e sobreposição opcional em fundo ABI (com cache compartilhado entre frames).
+5. **Paralelização:** processamento de frames via `ProcessPoolExecutor` (paralelismo de CPU), enquanto os downloads de cada frame rodam concorrentemente via `asyncio` (paralelismo de I/O).
+6. **Montagem do Vídeo:** se `generation_type = V`, o `imageio`/`ffmpeg` entra em ação costurando os frames em `.mp4` com controle de bitrate (CRF), preset e escala.
+
+O arquivo `utils.py` segura a bronca das funções compartilhadas: validações, projeções geoestacionárias, recortes de área, marca d'água, títulos e a trava de arquivo (file lock) pra evitar que dois workers engalfinhem tentando processar o mesmo fundo de GLM ao mesmo tempo.
+
+---
 
 ## Foco Regional: América do Sul
 
-Este software não é um gerador genérico de imagens GOES, as decisões de projeto são voltadas especificamente à operação sobre a América do Sul:
+Isso aqui não foi feito pra ser mais um gerador genérico. Cada linha de código foi pensada pra operar na América do Sul sem passar raiva:
 
-- **Satélite de referência**: GOES-19 (posição orbital em -75°) é o satélite operacional padrão para cobertura do continente sul-americano desde abril de 2025; o script alterna automaticamente para GOES-16 em datas anteriores a essa transição.
-- **Cobertura geográfica**: a região-alvo (`target_coordinates` em `config.ini`) é definida em coordenadas geográficas (oeste, leste, sul, norte), permitindo recortar com precisão qualquer sub-região do continente, reduzindo drasticamente o volume de dados processado em comparação ao disco completo do satélite.
-- **Fuso horário**: todos os horários de entrada e saída (busca no bucket, timestamps de imagem/vídeo, título das figuras) operam em **UTC**, evitando ambiguidade ao correlacionar com horários locais da América do Sul (UTC-3, UTC-4, UTC-5, conforme o país/estação).
-- **Cadência de dados**: os intervalos de captura (10 minutos para ABI, 20 segundos para GLM) refletem a cadência do modo Full Disk do satélite, que é o que garante cobertura contínua de todo o continente.
+- **Satélite de Referência:** O GOES-19 (na posição orbital 75°W) é o satélite oficial cobrindo o continente desde abril de 2025. Datas anteriores usam automaticamente o GOES-16 sem você precisar mexer em nada.
+- **Recorte Geográfico:** A chave `target_coordinates` usa coordenadas geográficas (Oeste, Leste, Sul, Norte). Você recorta exatamente a tempestade ou o estado que quer analisar, economizando processamento de CPU e memória RAM ao renderizar apenas a área de interesse, além de gerar arquivos de saída bem mais leves.
+- **Fuso Horário:** **Tudo opera em UTC.** Busca no bucket, timestamps das imagens, títulos e nomes de arquivos. Zero dor de cabeça com fusos do Brasil (UTC-3, UTC-4, UTC-5).
+- **Cadência do Satélite:** Os intervalos do script seguem o modo Full Disk real: 10 minutos para bandas ABI e 20 segundos para dados de raios GLM.
+
+---
 
 ## Configuração
 
-Toda a parametrização do sistema: canal, tipo de geração, período, workers, projeção, coordenadas, paletas de cor, estilo visual e parâmetros de codificação do vídeo, é feita através de dois arquivos:
+O comportamento do script é controlado por dois arquivos `.ini` principais:
 
-- **`config.ini`:** parâmetros gerais de execução, mapa e renderização.
-- **`colors.ini`:** paletas de cores por banda espectral e pelo GLM.
+- **`config.ini`:** regras gerais, período, workers, projeções, recortes, GLM e renderização do vídeo.
+- **`colors.ini`:** tabelas de cores hexadecimais por banda térmica e idade de raio do GLM.
 
-Cada chave está **documentada diretamente no próprio arquivo `.ini`**, incluindo formato esperado, valores válidos e regras de negócio. Consulte os comentários desses arquivos antes de alterar qualquer parâmetro, não há valores padrão: uma chave ausente ou fora do formato esperado interrompe a execução imediatamente.
+> **Regra Importante:** Não existem valores padrão implícitos no código. Se você apagar uma chave ou mandar um valor bizarro nas seções de tempo/canal, a validação inicial interrompe o script na hora. Se a cagada for em `[MAP]`, `[STYLE]` ou `colors.ini`, o erro estoura no primeiro worker que tentar renderizar o frame.
 
-### Pontos de atenção ao personalizar
+### Pontos de Atenção e Gambiarras
 
-- **Trocar `channel` (ABI ↔ GLM) exige revisar o formato de horário junto.** ABI usa `HH:MM` (sem segundos); GLM usa `HH:MM:SS` (com segundos). `image_time` (ou `start_time`/`end_time` em modo vídeo) precisa estar no formato do canal **novo**, não do anterior — o script não converte automaticamente e para com erro de formato se você esquecer.
-- **`target_coordinates` não é validado quanto à ordem dos valores.** O script confere que são 4 números, mas não confere se Oeste < Leste e Sul < Norte. Valores fora de ordem não geram erro na validação inicial — o mapa sai incorreto lá na frente.
-- **`glm_flash_age = False` remove o rastro de raios, não só a cor.** Com `False`, cada frame mostra apenas os raios daquele instante exato (sem histórico, sem legenda); as chaves `glm_history_lookback_steps`/`glm_history_max_concurrent_downloads` ficam sem efeito nesse modo.
-- **`glm_background_band` preenchido muda o nome do arquivo de saída** (sufixo `_CXX.png`). Alternar essa chave entre execuções pode deixar arquivos de nomes diferentes para o mesmo horário nas pastas de cache/saída. Além disso, um valor inválido nessa chave (fora de 1–16, ou não numérico) só é detectado **depois** de baixar o arquivo GLM principal daquele frame — não na validação inicial.
-- **O fundo ABI usado com o GLM pode estar até ~10 minutos atrasado em relação ao raio mostrado, sempre.** O ABI só captura a cada 10 minutos, mas o GLM a cada 20 segundos; o script sempre arredonda o horário do GLM **para trás** até o múltiplo de 10 anterior para escolher o fundo (ex.: um raio às 19:19:40 é sobreposto ao fundo ABI das 19:10, nunca das 19:20). Isso é o comportamento normal e sempre acontece, não é uma falha eventual — o fundo nunca representa exatamente o mesmo instante do raio, e as nuvens no fundo podem parecer "atrasadas" em relação à posição real dos raios.
-- **Vídeo de GLM com fundo ABI + `num_workers` alto:** o fundo de cada bloco de 10 minutos é gerado uma vez e compartilhado entre os frames GLM daquele bloco via um cache com trava entre processos. Em concorrência muito alta, um worker pode esperar até 5 minutos pelo fundo e, se estourar esse tempo, gerar aquele frame silenciosamente **sem** fundo (aviso no console, sem interromper a execução). Se notar frames sem fundo intercalados no vídeo, reduza `num_workers`.
-- **Trocar `figure_width`/`figure_height` no meio de um cache de frames existente (`satelite_temp_images` com `delete_temp_images = False`) pode gerar um vídeo com frames de proporções diferentes.** O vídeo usa as dimensões do *primeiro* frame como referência e redimensiona (esticando/comprimindo) qualquer frame de tamanho diferente para bater — isso inclui frames antigos do cache renderizados com outra `figure_width`/`figure_height`. Se for testar tamanhos de figura diferentes, limpe `satelite_temp_images` antes de gerar o vídeo final.
-- **A faixa do título (quando `clean_mode = False`) tem altura fixa em polegadas**, então ocupa uma fração maior ou menor da imagem dependendo de `figure_height`. Isso é esperado, não um bug: ajuste `figure_height` para reequilibrar visualmente se o título parecer grande/pequeno demais.
-- **Um timestamp "múltiplo de 10/20" válido no formato pode ainda não existir no bucket da NOAA** (falha de scan do satélite). Isso aparece como "arquivo não encontrado", não como erro de configuração — no modo vídeo, o frame é apenas pulado.
-- **Arquivos baixados menores que 8 KB são tratados como corrompidos/truncados** e descartados automaticamente (com nova tentativa, até o limite de retries). Isso é o motivo mais provável de um download ser re-tentado "sem razão aparente" em conexões instáveis — não é erro de configuração.
+1. **Formato de Horário ABI vs. GLM:**
+   - ABI usa `HH:MM` (ex: `22:30`).
+   - GLM usa `HH:MM:SS` (ex: `22:30:20`).
+   Se trocar a chave `channel` em `config.ini`, **você é obrigado a ajustar a chave de horário**, senão a validação quebra no seu colo.
+2. **Ordem das Coordenadas:** O script confere se você passou 4 números em `target_coordinates`, mas **não** checa se você colocou Oeste < Leste e Sul < Norte. Se invertê-los, a validação passa e o mapa sai cagado na renderização.
+3. **`glm_flash_age = False` desliga tudo:** Se colocar `False`, o script mostra apenas os raios do segundo exato do frame. O rastro histórico morre, a legenda desparece e as chaves de histórico (`glm_history_lookback_steps`) ficam sem efeito.
+4. **Sufixo de Cache `_CXX` no GLM:** Preencher `glm_background_band` adiciona o sufixo da banda no nome do frame (ex: `_C13.png`). Alternar essa chave no meio de testes vai duplicar arquivos na sua pasta temporária. Além disso, se você colocar uma banda inválida (fora de 1 a 16), o erro só vai estourar **depois** que o script já tiver baixado o arquivo GLM principal.
+5. **Lag no Fundo do GLM (Isso é normal!):** O ABI só atualiza a cada 10 min, mas o GLM anda de 20 em 20 segundos. O script sempre arredonda o horário do GLM **para trás** pro múltiplo de 10 anterior. Um raio das 19:19:40 vai rodar em cima do fundo ABI das 19:10 (lag de até 9 min e 40s). Não é bug, é limitação da física do satélite.
+6. **Estouro de Lock em Vídeos GLM:** Em vídeos GLM com fundo ABI e `num_workers` muito alto (tipo 12+), um worker pode ficar esperando a renderização do fundo por mais de 5 minutos. Se estourar o limite, o frame sai sem fundo e manda um aviso amarelo (⚠️) no console. Deu esse problema? Baixe o `num_workers`.
+7. **Cache de Frames com Resoluções Diferentes:** Se você mudar `figure_width` ou `figure_height` mantendo `delete_temp_images = False`, os frames antigos do cache vão ter tamanhos diferentes dos novos. O script (via Pillow) vai redimensionar os frames pra baterem com a dimensão do primeiro frame gerado, esticando ou deformando a imagem final no vídeo. Mudou a resolução? Limpe a pasta `satelite_temp_images`.
+8. **Proporção do Título:** A barra superior do título tem altura fixa em polegadas (quando `clean_mode = False`). Se a imagem parecer "engolida" pelo título, aumente o `figure_height`.
+9. **Imagens Faltantes na NOAA:** Nem todo timestamp existe no bucket da NOAA (falha de varredura). No modo vídeo (`generation_type = V`), o frame com falha é simplesmente pulado e o script avisa no console; no modo imagem única (`generation_type = I`), se o horário pedido não for encontrado, o script encerra com erro fatal.
+10. **Filtro de Arquivo Corrompido:** Downloads com menos de 8 KB são tratados como arquivo truncado/corrompido e descartados na hora. Se o script ficar tentando baixar o mesmo arquivo várias vezes em conexões ruins, é isso acontecendo.
+
+---
 
 ## Pré-requisitos
 
-- Python 3.10+
-- FFmpeg instalado e acessível no `PATH` do sistema (necessário apenas para `generation_type = V`)
+- **Python 3.10+**
+- **FFmpeg** instalado e adicionado ao `PATH` do sistema (obrigatório se `generation_type = V`).
+
+---
 
 ## Instalação
 
+Clone o repositório e acesse a pasta:
 
-```
-
-bash
-git clone 
-cd 
-
-```
-
-Recomenda-se o uso de um ambiente virtual:
-
-
-```
-
-bash
-python -m venv venv
-source venv/bin/activate   # Linux/macOS
-venv\Scripts\activate      # Windows
-
-pip install -r requirements.txt
-
-```
-
-> `cartopy` depende de bibliotecas geoespaciais nativas (GEOS, PROJ). Caso a instalação via `pip` falhe, utilize `conda`/`mamba` (`conda install -c conda-forge cartopy`) ou instale as dependências de sistema correspondentes à sua distribuição.
-
-## Uso
-
-> **Nota:** `config.ini` e `colors.ini` são sempre lidos a partir da pasta onde `index.py` está salvo, não da pasta de onde você executa o comando. Ou seja, se você rodar `python /algum/caminho/index.py` estando em outro diretório, o script ainda vai procurar os `.ini` ao lado do próprio `index.py`, e não no seu diretório atual.
-
-1. Edite `config.ini` para definir o canal (`GENERAL.channel`), o tipo de geração (`GENERAL.generation_type`: `I` para imagem única ou `V` para vídeo), o período desejado e a região de interesse (`MAP.target_coordinates`). **Se for trocar o canal entre ABI e GLM, lembre-se de ajustar também o formato de `image_time` (ou `start_time`/`end_time`) — veja "Pontos de atenção" abaixo.**
-2. Se necessário, ajuste as paletas de cor em `colors.ini` para o canal escolhido.
-3. Execute:
-
-
-```
-
-bash
-python index.py
-
-```
-
-A saída é gerada automaticamente em:
-
-- `satelite_images/`: imagens únicas (`generation_type = I`)
-- `satelite_videos/`: vídeos finalizados (`generation_type = V`)
-- `satelite_temp_images/`: frames intermediários do vídeo (removidos ao final se `delete_temp_images = True`)
-- `satelite_temp_downloads/`: cache temporário de arquivos NetCDF baixados
-
-O progresso, incluindo busca de arquivos no bucket, download, renderização e (quando aplicável) codificação do vídeo, é reportado no console, com um relatório final de tempo de execução por etapa.
+```bash
+git clone https://github.com/ArthurPH25/goes-image-generator
+cd goes-image-generator

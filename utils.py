@@ -21,14 +21,29 @@ GOES_TRANSITION_DATE = datetime(2025, 4, 7, tzinfo=timezone.utc)
 LOCK_POLL_INTERVAL_S = 0.5
 LOCK_STALE_TIMEOUT_S = 300
 
+_LOG_COLLECTOR = None
+
+def configure_log_collector(shared_list):
+    global _LOG_COLLECTOR
+    _LOG_COLLECTOR = shared_list
+
+def _record_log(level, message):
+    if _LOG_COLLECTOR is not None:
+        try:
+            _LOG_COLLECTOR.append((level, message))
+        except Exception:
+            pass
+
 def log_fatal(message):
     print(f"☠️ ERRO FATAL: {message}")
 
 def log_error(message):
     print(f"❌ ERRO: {message}")
+    _record_log("ERRO", message)
 
 def log_warning(message):
     print(f"⚠️ AVISO: {message}")
+    _record_log("AVISO", message)
 
 def log_success(message):
     print(f"✅ {message}")
@@ -340,6 +355,12 @@ def get_crop_slices(nc, target_coords, margin_frac=0.05, min_margin_px=6):
     row_start = max(row_start_raw - margin_rows, 0)
     row_end = min(row_end_raw + margin_rows, n_y)
     return slice(row_start, row_end), slice(col_start, col_end)
+
+def glm_nc_cache_paths(cache_dir, remote_path):
+    base_name = os.path.basename(remote_path).replace(".nc", "")
+    cache_data = os.path.join(cache_dir, f"glm_{base_name}.nc")
+    lock_path = os.path.join(cache_dir, f"glm_{base_name}.lock")
+    return cache_data, lock_path
 
 def background_cache_paths(cache_dir, satellite_bucket, band_id, background_dt):
     time_key = background_dt.strftime("%Y%j%H%M")

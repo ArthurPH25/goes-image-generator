@@ -22,6 +22,7 @@ A orquestração principal roda em `index.py`:
    - `GLM.py`: processa a densidade de raios do GLM, com rastro histórico (idade codificada por cor e tamanho de marcador) e sobreposição opcional em fundo ABI (com cache compartilhado entre frames).
 5. **Paralelização:** processamento de frames via `ProcessPoolExecutor` (paralelismo de CPU), enquanto os downloads de cada frame rodam concorrentemente via `asyncio` (paralelismo de I/O).
 6. **Montagem do Vídeo:** se `generation_type = V`, o `imageio`/`ffmpeg` entra em ação costurando os frames em `.mp4` com controle de bitrate (CRF), preset e escala.
+7. **Encerramento:** ao final (mesmo em caso de erro não fatal), o script imprime dois relatórios: o de tempo de execução por etapa, e um relatório consolidado de todos os avisos (⚠️) e erros (❌) ocorridos durante a busca de arquivos e o processamento dos frames, inclusive os que rodaram nos workers paralelos. Erros fatais (☠️) não entram nesse relatório porque eles já interrompem o script na hora em que acontecem.
 
 O arquivo `utils.py` segura a bronca das funções compartilhadas: validações, projeções geoestacionárias, recortes de área, marca d'água, títulos e a trava de arquivo (file lock) pra evitar que dois workers engalfinhem tentando processar o mesmo fundo de GLM ao mesmo tempo.
 
@@ -79,3 +80,89 @@ Clone o repositório e acesse a pasta:
 ```bash
 git clone https://github.com/ArthurPH25/goes-image-generator
 cd goes-image-generator
+```
+
+### Dependências de sistema (Cartopy)
+
+O `requirements.txt` cobre as bibliotecas Python, mas o `cartopy` depende de duas bibliotecas nativas — **GEOS** e **PROJ** — que não vêm pelo pip. Sem elas instaladas no sistema *antes*, o `pip install cartopy` falha na hora de compilar.
+
+**Ubuntu/Debian:**
+```bash
+sudo apt update
+sudo apt install libgeos-dev libproj-dev proj-bin proj-data
+```
+
+**Fedora:**
+```bash
+sudo dnf install geos-devel proj-devel proj-data
+```
+
+**macOS (Homebrew):**
+```bash
+brew install geos proj
+```
+
+**Windows:** o jeito mais tranquilo é usar o [Anaconda/Miniconda](https://docs.conda.io/en/latest/miniconda.html) e instalar o cartopy via conda-forge (ele já resolve os binários):
+```bash
+conda install -c conda-forge cartopy
+```
+
+Se você já usa conda em qualquer sistema, instalar o cartopy por ele evita esse tipo de dor de cabeça.
+
+### Ambientes headless / Docker
+
+O script roda sem problemas em servidor ou container sem interface gráfica — `matplotlib` já está configurado com o backend `Agg` (renderização sem tela) em todos os módulos. A única etapa que depende de ambiente gráfico é a abertura automática do vídeo ao final do modo `V` (`xdg-open`/`open`/`os.startfile`); num ambiente headless isso simplesmente não tem o que abrir, o script avisa no console e segue normal — o `.mp4` já está salvo em `satelite_videos/` de qualquer forma.
+
+### Instalando as dependências Python
+
+Com as bibliotecas de sistema prontas:
+
+```bash
+pip install -r requirements.txt
+```
+
+Garanta também que o **FFmpeg** esteja instalado e no `PATH` (obrigatório para `generation_type = V`):
+
+```bash
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# macOS
+brew install ffmpeg
+
+# Windows: baixe em https://ffmpeg.org/download.html e adicione a pasta bin/ ao PATH
+```
+
+Verifique com `ffmpeg -version`.
+
+---
+
+## Uso
+
+1. Edite `config.ini` e `colors.ini` na raiz do projeto com os parâmetros desejados (canal, data/hora, recorte geográfico, cores, etc — veja a seção [Configuração](#configuração) acima).
+2. Rode o script:
+
+```bash
+python index.py
+```
+
+3. Acompanhe o progresso pelo console: busca dos arquivos no S3, download, processamento dos frames e (se `generation_type = V`) montagem do vídeo.
+
+### Saída gerada
+
+O script cria as seguintes pastas na raiz do projeto conforme a necessidade:
+
+| Pasta | Conteúdo |
+|---|---|
+| `satelite_images/` | PNGs gerados no modo `generation_type = I` (imagem única) |
+| `satelite_videos/` | Vídeos `.mp4` gerados no modo `generation_type = V` |
+| `satelite_temp_images/` | Frames PNG intermediários usados para montar o vídeo (mantidos se `delete_temp_images = False`) |
+| `satelite_temp_downloads/` | Cache temporário de arquivos `.nc` baixados da NOAA e do fundo ABI/GLM (limpo automaticamente ao final da execução) |
+
+Ao final, o script imprime dois relatórios no console: tempo de execução por etapa (busca, download/processamento, montagem do vídeo) e um resumo consolidado de todos os avisos (⚠️) e erros (❌) não fatais ocorridos durante a execução, incluindo os que rodaram nos workers paralelos.
+
+---
+
+## Licença
+
+Este projeto está licenciado sob a [MIT License](LICENSE) — use, copie, modifique, distribua ou venda à vontade, com ou sem crédito obrigatório em qualquer parte do software, desde que o aviso de copyright original seja mantido. O software é fornecido "como está", sem garantias de qualquer tipo.

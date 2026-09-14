@@ -9,6 +9,7 @@ import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from multiprocessing import Manager
 
 if sys.platform == "win32":
     try:
@@ -28,12 +29,15 @@ from utils import (
     format_elapsed_time,
     parse_datetime,
     get_satellite_info,
-    log_fatal,
     log_error,
     log_warning,
     log_success,
     log_info,
     exit_fatal,
+    glm_nc_cache_paths,
+    acquire_background_lock,
+    release_background_lock,
+    configure_log_collector,
 )
 from S3_downloader import download_batch
 
@@ -47,6 +51,7 @@ IMAGES_DIR = "satelite_images"
 VIDEOS_DIR = "satelite_videos"
 TEMP_IMAGES_DIR = "satelite_temp_images"
 TEMP_NC_DIR = "satelite_temp_downloads"
+GLM_NC_CACHE_DIR = os.path.join(TEMP_NC_DIR, "glm_nc_cache")
 
 GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
 ABI_REQUIRED_VARS = ["CMI"]
@@ -130,14 +135,18 @@ def build_png_name(remote_file):
         png_name = png_name.replace(".png", f"_C{int(glm_background_band):02d}.png")
     return png_name
 
+def _init_worker_log_collector(shared_log_list):
+    configure_log_collector(shared_log_list)
+
 def process_file_worker(args):
     remote_file, remote_abi_file, output_path, sat_name, target_ts, current_gen_type = args
     target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
 
+    glm_cache_lock_path = None
+    got_glm_lock = False
     try:
         file_name = remote_file.split("/")[-1]
         png_path = os.path.join(output_path, build_png_name(remote_file))
-        local_nc_path = os.path.join(TEMP_NC_DIR, f"temp_{file_name}")
 
         if is_glm:
             pretty_time = target_dt.strftime("%Y%j%H%M%S")
@@ -150,19 +159,46 @@ def process_file_worker(args):
             log_info(f"[{log_time} UTC] Frame já existe no cache. Pulando.")
             return True
 
-        batch = [{
-            "remote_path": remote_file,
-            "local_path": local_nc_path,
-            "required_variables": GLM_REQUIRED_VARS if is_glm else ABI_REQUIRED_VARS,
-            "label": f"{log_time} principal",
-        }]
-
-        log_info(f"[{log_time} UTC] Baixando {len(batch)} arquivo(s) concorrentemente.")
-        results = download_batch(batch, max_concurrent=max_concurrent_downloads)
-
-        main_ok, main_msg = results[remote_file]
-        if not main_ok:
-            raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
+        if is_glm:
+            os.makedirs(GLM_NC_CACHE_DIR, exist_ok=True)
+            cache_path, glm_cache_lock_path = glm_nc_cache_paths(GLM_NC_CACHE_DIR, remote_file)
+            local_nc_path = cache_path
+            if os.path.exists(cache_path):
+                log_info(f"[{log_time} UTC] NetCDF principal já em cache (reaproveitado de outro frame).")
+            else:
+                got_glm_lock = acquire_background_lock(glm_cache_lock_path)
+                try:
+                    if os.path.exists(cache_path):
+                        log_info(f"[{log_time} UTC] NetCDF principal já em cache (reaproveitado de outro frame).")
+                    else:
+                        batch = [{
+                            "remote_path": remote_file,
+                            "local_path": cache_path,
+                            "required_variables": GLM_REQUIRED_VARS,
+                            "label": f"{log_time} principal",
+                        }]
+                        log_info(f"[{log_time} UTC] Baixando {len(batch)} arquivo(s) concorrentemente.")
+                        results = download_batch(batch, max_concurrent=max_concurrent_downloads)
+                        main_ok, main_msg = results[remote_file]
+                        if not main_ok:
+                            raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
+                finally:
+                    if got_glm_lock:
+                        release_background_lock(glm_cache_lock_path)
+                        got_glm_lock = False
+        else:
+            local_nc_path = os.path.join(TEMP_NC_DIR, f"temp_{file_name}")
+            batch = [{
+                "remote_path": remote_file,
+                "local_path": local_nc_path,
+                "required_variables": ABI_REQUIRED_VARS,
+                "label": f"{log_time} principal",
+            }]
+            log_info(f"[{log_time} UTC] Baixando {len(batch)} arquivo(s) concorrentemente.")
+            results = download_batch(batch, max_concurrent=max_concurrent_downloads)
+            main_ok, main_msg = results[remote_file]
+            if not main_ok:
+                raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
 
         log_info(f"[{log_time} UTC] Processando dados e salvando PNG.")
 
@@ -176,7 +212,7 @@ def process_file_worker(args):
         if not os.path.exists(png_path):
             raise Exception("O módulo do canal não gerou o PNG esperado (falha silenciosa).")
 
-        if os.path.exists(local_nc_path):
+        if not is_glm and os.path.exists(local_nc_path):
             os.remove(local_nc_path)
 
         gc.collect()
@@ -185,6 +221,9 @@ def process_file_worker(args):
     except Exception as e:
         log_error(f"[WORKER] Falha ao gerar a imagem do timestamp {target_ts}: {e}")
         return False
+    finally:
+        if got_glm_lock and glm_cache_lock_path:
+            release_background_lock(glm_cache_lock_path)
 
 def process_satellite():
     t_start_total = time.time()
@@ -196,6 +235,10 @@ def process_satellite():
         if start is None or end is None:
             return "não medido (execução interrompida antes desta etapa)"
         return format_elapsed_time(end - start)
+
+    log_manager = Manager()
+    shared_log_list = log_manager.list()
+    configure_log_collector(shared_log_list)
 
     try:
         os.makedirs(output_dir, exist_ok=True)
@@ -270,8 +313,7 @@ def process_satellite():
         t_end_search = time.time()
 
         if not tasks:
-            log_fatal("Nenhum arquivo encontrado para as datas configuradas. Revise o 'config.ini'.")
-            return
+            exit_fatal("Nenhum arquivo encontrado para as datas configuradas. Revise o 'config.ini'.")
 
         print()
         log_info(f"Iniciando {num_workers} worker(s) (até {max_concurrent_downloads} downloads concorrentes cada)...")
@@ -282,7 +324,11 @@ def process_satellite():
         total_tasks = len(tasks)
 
         t_start_images = time.time()
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_init_worker_log_collector,
+            initargs=(shared_log_list,),
+        ) as executor:
             futures = {executor.submit(process_file_worker, t): t for t in tasks}
 
             for future in as_completed(futures):
@@ -357,25 +403,40 @@ def process_satellite():
                         if platform.system() == 'Windows':
                             os.startfile(video_filename)
                         elif platform.system() == 'Darwin':
-                            subprocess.call(['open', video_filename])
+                            subprocess.run(['open', video_filename], check=True,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         else:
-                            subprocess.call(['xdg-open', video_filename])
+                            subprocess.run(['xdg-open', video_filename], check=True,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     except Exception:
-                        log_info(f"Não foi possível abrir o player de vídeo automaticamente. Arquivo salvo em: {video_filename}")
+                        log_warning(f"Não foi possível abrir o player de vídeo automaticamente (ambiente sem suporte gráfico?). Arquivo salvo em: {video_filename}")
                 t_end_video = time.time()
             else:
-                log_fatal("O modo configurado é de vídeo, mas nenhuma imagem foi gerada. Não é possível montar o vídeo.")
+                exit_fatal("O modo configurado é de vídeo, mas nenhuma imagem foi gerada. Não é possível montar o vídeo.")
 
     except Exception as e:
-        log_fatal(f"Execução interrompida por um erro não tratado: {e}")
+        exit_fatal(f"Execução interrompida por um erro não tratado: {e}")
     finally:
         if is_glm and glm_background_band and os.path.isdir(TEMP_NC_DIR):
             leftover = [f for f in os.listdir(TEMP_NC_DIR) if f.startswith("bg_") or f.startswith("temp_bg_")]
             if leftover:
-                log_info(f"Limpando {len(leftover)} arquivo(s) de cache de fundo GLM em '{TEMP_NC_DIR}'.")
+                log_info(f"Limpando {len(leftover)} arquivo(s) de cache de fundo GLM em '{TEMP_NC_DIR}'...")
                 for name in leftover:
                     try:
                         os.remove(os.path.join(TEMP_NC_DIR, name))
+                    except OSError:
+                        pass
+
+        if is_glm and os.path.isdir(GLM_NC_CACHE_DIR):
+            nc_cache_files = [f for f in os.listdir(GLM_NC_CACHE_DIR) if f.endswith(".nc")]
+            if nc_cache_files:
+                log_info(
+                    f"Limpando {len(nc_cache_files)} arquivo(s) .nc do cache compartilhado GLM "
+                    f"em '{GLM_NC_CACHE_DIR}'..."
+                )
+                for name in nc_cache_files:
+                    try:
+                        os.remove(os.path.join(GLM_NC_CACHE_DIR, name))
                     except OSError:
                         pass
         t_end_total = time.time()
@@ -392,6 +453,32 @@ def process_satellite():
 
         print(f"TEMPO TOTAL DE EXECUÇÃO: {calc_time(t_start_total, t_end_total)}")
         print("=" * 70)
+
+        try:
+            collected_logs = list(shared_log_list)
+        except Exception:
+            collected_logs = []
+
+        print()
+        print("=" * 70)
+        print("RELATÓRIO DE AVISOS E ERROS")
+        print("=" * 70)
+        if not collected_logs:
+            print("Nenhum aviso ou erro registrado durante a execução.")
+        else:
+            warning_count = sum(1 for level, _ in collected_logs if level == "AVISO")
+            error_count = sum(1 for level, _ in collected_logs if level == "ERRO")
+            print(f"Total: {warning_count} aviso(s), {error_count} erro(s).")
+            print("-" * 70)
+            for level, message in collected_logs:
+                icon = "⚠️" if level == "AVISO" else "❌"
+                print(f"{icon} [{level}] {message}")
+        print("=" * 70)
+
+        try:
+            log_manager.shutdown()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     process_satellite()

@@ -1,6 +1,5 @@
 import asyncio
 import os
-import tempfile
 from datetime import timedelta
 
 import matplotlib
@@ -30,10 +29,12 @@ from utils import (
     load_background_data,
     acquire_background_lock,
     release_background_lock,
+    glm_nc_cache_paths,
 )
 from S3_downloader import download_batch, download_batch_async, CONNECT_TIMEOUT_S, READ_TIMEOUT_S
 
 BACKGROUND_CACHE_DIR = "satelite_temp_downloads"
+GLM_NC_CACHE_DIR = os.path.join(BACKGROUND_CACHE_DIR, "glm_nc_cache")
 ABI_REQUIRED_VARS = ["CMI"]
 
 TITLE_FONTSIZE_PT = 16
@@ -68,7 +69,7 @@ def _parse_age_palette(config, show_flash_age):
             )
     return default_color, sorted_colors
 
-async def _list_and_download_history(target_dt, sat_bucket, tmp_dir, max_lookback_steps, max_concurrent_history):
+async def _list_and_download_history(target_dt, sat_bucket, cache_dir, max_lookback_steps, max_concurrent_history):
     fs = s3fs.S3FileSystem(
         anon=True,
         asynchronous=True,
@@ -120,13 +121,34 @@ async def _list_and_download_history(target_dt, sat_bucket, tmp_dir, max_lookbac
     results = []
 
     async def download_one(age_seconds, remote_path):
-        local_path = os.path.join(tmp_dir, f"hist_{age_seconds}_{os.path.basename(remote_path)}")
+        cache_path, lock_path = glm_nc_cache_paths(cache_dir, remote_path)
         async with semaphore:
+            if os.path.exists(cache_path):
+                return age_seconds, cache_path
+            got_lock = await asyncio.to_thread(acquire_background_lock, lock_path)
             try:
-                await fs._get(remote_path, local_path)
-                return age_seconds, local_path
-            except Exception:
-                return None
+                if os.path.exists(cache_path):
+                    return age_seconds, cache_path
+                if not got_lock:
+                    log_warning(
+                        f"Timeout esperando lock do histórico GLM ({os.path.basename(remote_path)}); "
+                        "tentando baixar mesmo assim."
+                    )
+                tmp_download_path = f"{cache_path}.part_{os.getpid()}"
+                try:
+                    await fs._get(remote_path, tmp_download_path)
+                    os.replace(tmp_download_path, cache_path)
+                    return age_seconds, cache_path
+                except Exception:
+                    if os.path.exists(tmp_download_path):
+                        try:
+                            os.remove(tmp_download_path)
+                        except OSError:
+                            pass
+                    return None
+            finally:
+                if got_lock:
+                    release_background_lock(lock_path)
 
     download_tasks = [download_one(age, path) for age, path in candidates]
     downloaded = await asyncio.gather(*download_tasks)
@@ -139,22 +161,22 @@ async def _list_and_download_history(target_dt, sat_bucket, tmp_dir, max_lookbac
 
     return results
 
-def _fetch_flash_history(target_dt, sat_bucket, max_lookback_steps, max_concurrent_history):
-    with tempfile.TemporaryDirectory(prefix="glm_history_") as tmp_dir:
-        history_files = asyncio.run(
-            _list_and_download_history(target_dt, sat_bucket, tmp_dir, max_lookback_steps, max_concurrent_history)
-        )
-        parsed = []
-        for age_seconds, local_path in history_files:
-            try:
-                with Dataset(local_path, "r") as nc_past:
-                    if "flash_lon" in nc_past.variables and "flash_lat" in nc_past.variables:
-                        lons = list(nc_past.variables["flash_lon"][:])
-                        lats = list(nc_past.variables["flash_lat"][:])
-                        parsed.append((age_seconds, lons, lats))
-            except Exception:
-                continue
-        return parsed
+def _fetch_flash_history(target_dt, sat_bucket, cache_dir, max_lookback_steps, max_concurrent_history):
+    os.makedirs(cache_dir, exist_ok=True)
+    history_files = asyncio.run(
+        _list_and_download_history(target_dt, sat_bucket, cache_dir, max_lookback_steps, max_concurrent_history)
+    )
+    parsed = []
+    for age_seconds, local_path in history_files:
+        try:
+            with Dataset(local_path, "r") as nc_past:
+                if "flash_lon" in nc_past.variables and "flash_lat" in nc_past.variables:
+                    lons = list(nc_past.variables["flash_lon"][:])
+                    lats = list(nc_past.variables["flash_lat"][:])
+                    parsed.append((age_seconds, lons, lats))
+        except Exception:
+            continue
+    return parsed
 
 def _resolve_cached_background(target_dt, band_id, remote_abi_file, config, map_geo, current_gen_type):
     abi_minute = (target_dt.minute // 10) * 10
@@ -313,7 +335,9 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, target_d
 
     if sorted_colors:
         sat_bucket, _ = get_satellite_info(target_dt)
-        history = _fetch_flash_history(target_dt, sat_bucket, max_lookback_steps, max_concurrent_history)
+        history = _fetch_flash_history(
+            target_dt, sat_bucket, GLM_NC_CACHE_DIR, max_lookback_steps, max_concurrent_history
+        )
         for age_seconds, lons, lats in history:
             all_lons.extend(lons)
             all_lats.extend(lats)

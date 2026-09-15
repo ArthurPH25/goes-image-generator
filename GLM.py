@@ -30,14 +30,15 @@ from utils import (
     acquire_background_lock,
     release_background_lock,
     glm_nc_cache_paths,
+    TEMP_NC_DIR,
+    GLM_NC_CACHE_DIR,
+    ABI_REQUIRED_VARS,
+    TITLE_FONTSIZE_PT,
+    floor_to_abi_step,
 )
 from S3_downloader import download_batch, download_batch_async, CONNECT_TIMEOUT_S, READ_TIMEOUT_S
 
-BACKGROUND_CACHE_DIR = "satelite_temp_downloads"
-GLM_NC_CACHE_DIR = os.path.join(BACKGROUND_CACHE_DIR, "glm_nc_cache")
-ABI_REQUIRED_VARS = ["CMI"]
-
-TITLE_FONTSIZE_PT = 16
+BACKGROUND_CACHE_DIR = TEMP_NC_DIR
 
 def _get_color_for_age(age_seconds, sorted_colors):
     chosen_color = sorted_colors[0][1]
@@ -179,8 +180,7 @@ def _fetch_flash_history(target_dt, sat_bucket, cache_dir, max_lookback_steps, m
     return parsed
 
 def _resolve_cached_background(target_dt, band_id, remote_abi_file, config, map_geo, current_gen_type):
-    abi_minute = (target_dt.minute // 10) * 10
-    background_dt = target_dt.replace(minute=abi_minute, second=0, microsecond=0)
+    background_dt = floor_to_abi_step(target_dt)
     sat_bucket, _ = get_satellite_info(background_dt)
 
     if not remote_abi_file:
@@ -316,24 +316,26 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, target_d
     try:
         nc = Dataset(local_path)
         try:
-            sat_h, sat_lon, parsed_req, parsed_rpol = get_projection_params(nc, "goes_lat_lon_projection")
-            if parsed_req and parsed_rpol:
-                sat_req, sat_rpol = parsed_req, parsed_rpol
-        except (KeyError, AttributeError):
-            pass
+            try:
+                sat_h, sat_lon, parsed_req, parsed_rpol = get_projection_params(nc, "goes_lat_lon_projection")
+                if parsed_req and parsed_rpol:
+                    sat_req, sat_rpol = parsed_req, parsed_rpol
+            except (KeyError, AttributeError):
+                pass
 
-        if "flash_lon" in nc.variables and "flash_lat" in nc.variables:
-            flash_count = len(nc.variables["flash_lon"][:])
-            all_lons.extend(nc.variables["flash_lon"][:])
-            all_lats.extend(nc.variables["flash_lat"][:])
-            all_colors.extend([current_flash_color] * flash_count)
-            all_sizes.extend([current_flash_size] * flash_count)
-        nc.close()
+            if "flash_lon" in nc.variables and "flash_lat" in nc.variables:
+                flash_count = len(nc.variables["flash_lon"][:])
+                all_lons.extend(nc.variables["flash_lon"][:])
+                all_lats.extend(nc.variables["flash_lat"][:])
+                all_colors.extend([current_flash_color] * flash_count)
+                all_sizes.extend([current_flash_size] * flash_count)
+        finally:
+            nc.close()
     except Exception as e:
         log_error(f"Falha ao ler o arquivo principal do GLM: {e}")
         return
 
-    if sorted_colors:
+    if show_flash_age and sorted_colors:
         sat_bucket, _ = get_satellite_info(target_dt)
         history = _fetch_flash_history(
             target_dt, sat_bucket, GLM_NC_CACHE_DIR, max_lookback_steps, max_concurrent_history
@@ -418,4 +420,4 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, target_d
                             edgecolor="white", labelcolor="white", fontsize=12)
         legend.set_zorder(6)
 
-    save_figure(fig, png_path, dpi, style["clean_mode"])
+    save_figure(fig, png_path, dpi)

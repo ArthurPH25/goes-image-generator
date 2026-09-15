@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-import time
 
 import s3fs
 from botocore.config import Config as BotoConfig
@@ -34,6 +33,8 @@ def _is_not_found_error(exc: Exception) -> bool:
     return "404" in msg or "no such key" in msg or "not found" in msg
 
 def _is_transient_network_error(exc: Exception) -> bool:
+    if isinstance(exc, (PermissionError, IsADirectoryError)):
+        return False
     transient_types = (
         asyncio.TimeoutError,
         TimeoutError,
@@ -151,30 +152,3 @@ def download_batch(
     max_retries: int = MAX_RETRIES,
 ) -> dict[str, tuple[bool, str]]:
     return asyncio.run(download_batch_async(downloads, max_concurrent, max_retries))
-
-if __name__ == "__main__":
-    demo_bucket = "noaa-goes19/GLM-L2-LCFA/2024/200/12/"
-    fs_sync = s3fs.S3FileSystem(anon=True)
-    try:
-        files = fs_sync.ls(demo_bucket)[:3]
-    except Exception as e:
-        print(f"Não foi possível listar bucket de demonstração: {e}")
-        files = []
-    if files:
-        os.makedirs("/tmp/glm_test", exist_ok=True)
-        batch = [
-            {
-                "remote_path": f,
-                "local_path": f"/tmp/glm_test/{f.split('/')[-1]}",
-                "required_variables": ["flash_lon", "flash_lat"],
-                "label": f.split("/")[-1],
-            }
-            for f in files
-        ]
-        t0 = time.time()
-        results = download_batch(batch, max_concurrent=8)
-        elapsed = time.time() - t0
-        print(f"\nBaixados {len(files)} arquivos concorrentemente em {elapsed:.2f}s")
-        for remote, (ok, msg) in results.items():
-            status = "✅" if ok else "❌"
-            print(f"{status} {remote.split('/')[-1]}: {msg}")

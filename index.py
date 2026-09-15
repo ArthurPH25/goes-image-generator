@@ -37,7 +37,15 @@ from utils import (
     glm_nc_cache_paths,
     acquire_background_lock,
     release_background_lock,
+    acquire_instance_lock,
+    release_instance_lock,
     configure_log_collector,
+    compute_render_signature,
+    floor_to_abi_step,
+    TEMP_NC_DIR,
+    GLM_NC_CACHE_DIR,
+    ABI_REQUIRED_VARS,
+    GLM_REQUIRED_VARS,
 )
 from S3_downloader import download_batch
 
@@ -50,11 +58,7 @@ COLORS_PATH = os.path.join(SCRIPT_DIR, "colors.ini")
 IMAGES_DIR = "satelite_images"
 VIDEOS_DIR = "satelite_videos"
 TEMP_IMAGES_DIR = "satelite_temp_images"
-TEMP_NC_DIR = "satelite_temp_downloads"
-GLM_NC_CACHE_DIR = os.path.join(TEMP_NC_DIR, "glm_nc_cache")
-
-GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
-ABI_REQUIRED_VARS = ["CMI"]
+INSTANCE_LOCK_PATH = os.path.join(TEMP_NC_DIR, "instance.lock")
 
 config = configparser.ConfigParser()
 if len(config.read([COLORS_PATH, CONFIG_PATH])) < 2:
@@ -72,17 +76,20 @@ try:
     if gen_type not in ["I", "V"]:
         exit_fatal(f"generation_type '{gen_type}' inválido. Os valores válidos são 'I' ou 'V'.")
 
-    output_dir = IMAGES_DIR if gen_type == "I" else TEMP_IMAGES_DIR
-
     num_workers = config.getint("PROCESSING", "num_workers")
     delete_temp = config.getboolean("PROCESSING", "delete_temp_images")
     max_concurrent_downloads = config.getint("PROCESSING", "max_concurrent_downloads")
+    dpi = config.getint("PROCESSING", "dpi")
 
     video_scale = config.get("FFMPEG", "video_scale")
     crf_value = config.get("FFMPEG", "crf")
     ffmpeg_preset = config.get("FFMPEG", "preset")
 
     glm_background_band = config.get("MAP", "glm_background_band").strip()
+
+    render_signature = compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi)
+    run_temp_dir = os.path.join(TEMP_IMAGES_DIR, render_signature)
+    output_dir = IMAGES_DIR if gen_type == "I" else run_temp_dir
 
     target_dates = []
 
@@ -135,6 +142,14 @@ def build_png_name(remote_file):
         png_name = png_name.replace(".png", f"_C{int(glm_background_band):02d}.png")
     return png_name
 
+def _is_valid_png(path):
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
 def _init_worker_log_collector(shared_log_list):
     configure_log_collector(shared_log_list)
 
@@ -156,8 +171,11 @@ def process_file_worker(args):
         log_time = pretty_time
 
         if current_gen_type == "V" and os.path.exists(png_path):
-            log_info(f"[{log_time} UTC] Frame já existe no cache. Pulando.")
-            return True
+            if _is_valid_png(png_path):
+                log_info(f"[{log_time} UTC] Frame já existe no cache. Pulando.")
+                return True
+            log_warning(f"[{log_time} UTC] Frame em cache estava corrompido (execução anterior interrompida?). Regenerando.")
+            os.remove(png_path)
 
         if is_glm:
             os.makedirs(GLM_NC_CACHE_DIR, exist_ok=True)
@@ -239,12 +257,23 @@ def process_satellite():
     log_manager = Manager()
     shared_log_list = log_manager.list()
     configure_log_collector(shared_log_list)
+    got_instance_lock = False
 
     try:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(TEMP_NC_DIR, exist_ok=True)
         if gen_type == "V":
             os.makedirs(VIDEOS_DIR, exist_ok=True)
+
+        got_instance_lock = acquire_instance_lock(INSTANCE_LOCK_PATH)
+        if not got_instance_lock:
+            exit_fatal(
+                "Já existe outra execução deste script em andamento nesta pasta "
+                f"(lock ativo em '{INSTANCE_LOCK_PATH}'). Rodar duas instâncias ao mesmo tempo no "
+                "mesmo diretório corrompe os caches compartilhados de download (TEMP_NC_DIR/GLM_NC_CACHE_DIR), "
+                "que são apagados por inteiro ao final de cada execução. Espere a outra terminar ou, se "
+                "tiver certeza de que não há nenhuma rodando, apague o arquivo de lock manualmente."
+            )
 
         if is_glm and glm_background_band:
             channel_label = f"GLM (fundo {glm_background_band})"
@@ -255,6 +284,8 @@ def process_satellite():
         print("🛰️ GERADOR DE IMAGENS DE SATÉLITE 🛰️")
         print(f"Modo: {'Vídeo' if gen_type == 'V' else 'Imagem Única'} | Canal Ativo: {channel_label}")
         print(f"Alvo: {config.get('MAP', 'target_coordinates')}")
+        if gen_type == "V":
+            print(f"Pasta de frames desta execução: {run_temp_dir}")
         time_fmt = "%d/%m/%Y %H:%M:%S" if is_glm else "%d/%m/%Y %H:%M"
         if gen_type == "I":
             print(f"Instante: {target_dates[0].strftime(time_fmt)} UTC")
@@ -286,15 +317,19 @@ def process_satellite():
                 channel_str = "GLM-L2-LCFA"
 
                 if glm_background_band:
-                    abi_minute = (minute // 10) * 10
+                    abi_minute = floor_to_abi_step(target).minute
                     abi_bucket_path = f"{sat_bucket}/ABI-L2-CMIPF/{year}/{day_of_year:03d}/{hour:02d}/"
                     abi_prefix = f"s{year:04d}{day_of_year:03d}{hour:02d}{abi_minute:02d}"
                     abi_ch_str = f"M6C{int(glm_background_band):02d}"
                     try:
                         abi_list = S3_fs.ls(abi_bucket_path)
                         found_abi_file = next((f for f in abi_list if abi_ch_str in f and abi_prefix in f), None)
-                    except Exception:
-                        pass
+                        if found_abi_file is None:
+                            log_warning(
+                                f"Fundo ABI {abi_ch_str} das {abi_minute:02d}min não encontrado no bucket; frame sairá sem fundo."
+                            )
+                    except Exception as e:
+                        log_warning(f"Falha ao buscar o fundo ABI {abi_ch_str} no bucket: {e}")
             else:
                 bucket_path = f"{sat_bucket}/ABI-L2-CMIPF/{year}/{day_of_year:03d}/{hour:02d}/"
                 prefix = f"s{year:04d}{day_of_year:03d}{hour:02d}{minute:02d}"
@@ -355,62 +390,76 @@ def process_satellite():
                 t_start_video = time.time()
                 log_info("Iniciando a montagem do vídeo.")
 
-                video_frames = []
-                for task in tasks:
-                    expected_name = build_png_name(task[0])
-                    frame_path = os.path.join(output_dir, expected_name)
-                    if os.path.exists(frame_path):
-                        video_frames.append(frame_path)
-
-                if video_frames:
-                    time_fmt_out = "%Y%m%d_%H%M%S" if is_glm else "%Y%m%d_%H%M"
-                    video_filename = os.path.join(VIDEOS_DIR, f"satelite_{target_dates[0].strftime(time_fmt_out)}_ate_{target_dates[-1].strftime(time_fmt_out)}.mp4")
-                    ffmpeg_args = ['-crf', str(crf_value), '-preset', ffmpeg_preset, '-vf', video_scale, '-loglevel', 'error']
-
-                    log_info(f"Codificando com FFmpeg (CRF {crf_value}, scale {video_scale}).")
-
-                    first_frame_img = Image.open(video_frames[0])
-                    target_dimensions = first_frame_img.size
-                    first_frame_img.close()
-
-                    with imageio.get_writer(video_filename, format='FFMPEG', fps=video_fps, macro_block_size=None, ffmpeg_params=ffmpeg_args) as video_writer:
-                        total_frames = len(video_frames)
-                        for idx, frame_path in enumerate(video_frames):
-                            current_frame = idx + 1
-
-                            if current_frame == 1 or current_frame % 10 == 0 or current_frame == total_frames:
-                                log_info(f"Adicionando frame {current_frame}/{total_frames} ao vídeo.")
-
-                            img_object = Image.open(frame_path)
-                            if img_object.size != target_dimensions:
-                                try:
-                                    resampling_filter = Image.Resampling.LANCZOS
-                                except AttributeError:
-                                    resampling_filter = Image.LANCZOS
-                                img_object = img_object.resize(target_dimensions, resampling_filter)
-                            video_writer.append_data(np.array(img_object))
-                            img_object.close()
-
-                    log_success(f"Vídeo exportado em: {video_filename}")
-
-                    if delete_temp:
-                        log_info(f"Removendo a pasta temporária '{TEMP_IMAGES_DIR}'.")
-                        shutil.rmtree(TEMP_IMAGES_DIR, ignore_errors=True)
-                    else:
-                        log_info(f"Os frames usados foram mantidos em '{TEMP_IMAGES_DIR}'.")
-
-                    try:
-                        if platform.system() == 'Windows':
-                            os.startfile(video_filename)
-                        elif platform.system() == 'Darwin':
-                            subprocess.run(['open', video_filename], check=True,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    video_frames = []
+                    skipped_corrupt = 0
+                    for task in tasks:
+                        expected_name = build_png_name(task[0])
+                        frame_path = os.path.join(output_dir, expected_name)
+                        if not os.path.exists(frame_path):
+                            continue
+                        if _is_valid_png(frame_path):
+                            video_frames.append(frame_path)
                         else:
-                            subprocess.run(['xdg-open', video_filename], check=True,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception:
-                        log_warning(f"Não foi possível abrir o player de vídeo automaticamente (ambiente sem suporte gráfico?). Arquivo salvo em: {video_filename}")
-                t_end_video = time.time()
+                            skipped_corrupt += 1
+
+                    if skipped_corrupt:
+                        log_warning(f"{skipped_corrupt} frame(s) em disco estavam corrompidos e foram excluídos do vídeo.")
+
+                    if video_frames:
+                        time_fmt_out = "%Y%m%d_%H%M%S" if is_glm else "%Y%m%d_%H%M"
+                        video_filename = os.path.join(VIDEOS_DIR, f"satelite_{target_dates[0].strftime(time_fmt_out)}_ate_{target_dates[-1].strftime(time_fmt_out)}_fps{video_fps}.mp4")
+                        ffmpeg_args = ['-crf', str(crf_value), '-preset', ffmpeg_preset, '-vf', video_scale, '-loglevel', 'error']
+
+                        log_info(f"Codificando com FFmpeg (CRF {crf_value}, scale {video_scale}).")
+
+                        first_frame_img = Image.open(video_frames[0])
+                        target_dimensions = first_frame_img.size
+                        first_frame_img.close()
+
+                        with imageio.get_writer(video_filename, format='FFMPEG', fps=video_fps, macro_block_size=None, ffmpeg_params=ffmpeg_args) as video_writer:
+                            total_frames = len(video_frames)
+                            for idx, frame_path in enumerate(video_frames):
+                                current_frame = idx + 1
+
+                                if current_frame == 1 or current_frame % 10 == 0 or current_frame == total_frames:
+                                    log_info(f"Adicionando frame {current_frame}/{total_frames} ao vídeo.")
+
+                                img_object = Image.open(frame_path)
+                                if img_object.size != target_dimensions:
+                                    try:
+                                        resampling_filter = Image.Resampling.LANCZOS
+                                    except AttributeError:
+                                        resampling_filter = Image.LANCZOS
+                                    img_object = img_object.resize(target_dimensions, resampling_filter)
+                                video_writer.append_data(np.array(img_object))
+                                img_object.close()
+
+                        log_success(f"Vídeo exportado em: {video_filename}")
+
+                        if delete_temp:
+                            log_info(f"Removendo a pasta temporária desta execução '{run_temp_dir}'.")
+                            shutil.rmtree(run_temp_dir, ignore_errors=True)
+                        else:
+                            log_info(f"Os frames usados foram mantidos em '{run_temp_dir}'.")
+
+                        try:
+                            if platform.system() == 'Windows':
+                                os.startfile(video_filename)
+                            elif platform.system() == 'Darwin':
+                                subprocess.run(['open', video_filename], check=True,
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            else:
+                                subprocess.run(['xdg-open', video_filename], check=True,
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            log_warning(f"Não foi possível abrir o player de vídeo automaticamente (ambiente sem suporte gráfico?). Arquivo salvo em: {video_filename}")
+                    else:
+                        log_error("Nenhum frame PNG válido foi encontrado em disco para montar o vídeo, apesar de sucessos reportados. Verifique a pasta de frames.")
+                except Exception as e:
+                    log_error(f"Falha ao montar o vídeo final: {e}")
+                finally:
+                    t_end_video = time.time()
             else:
                 exit_fatal("O modo configurado é de vídeo, mas nenhuma imagem foi gerada. Não é possível montar o vídeo.")
 
@@ -480,5 +529,10 @@ def process_satellite():
         except Exception:
             pass
 
+        if got_instance_lock:
+            release_instance_lock(INSTANCE_LOCK_PATH)
+
 if __name__ == "__main__":
     process_satellite()
+    if sys.stdin.isatty():
+        input("\nPressione Enter para sair...")

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import sys
 import time
@@ -7,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.patheffects as path_effects
 import matplotlib.transforms as mtransforms
 from matplotlib.textpath import TextPath
@@ -20,6 +23,11 @@ GOES_TRANSITION_DATE = datetime(2025, 4, 7, tzinfo=timezone.utc)
 
 LOCK_POLL_INTERVAL_S = 0.5
 LOCK_STALE_TIMEOUT_S = 300
+
+TEMP_NC_DIR = "satelite_temp_downloads"
+GLM_NC_CACHE_DIR = os.path.join(TEMP_NC_DIR, "glm_nc_cache")
+ABI_REQUIRED_VARS = ["CMI"]
+GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
 
 _LOG_COLLECTOR = None
 
@@ -80,18 +88,16 @@ def parse_datetime(date_str, time_str, require_seconds):
     time_format = "%H:%M:%S" if has_seconds else "%H:%M"
     return datetime.strptime(full_str, f"%Y-%m-%d {time_format}").replace(tzinfo=timezone.utc)
 
-def format_pretty_time(pretty_time):
-    if not pretty_time:
-        return pretty_time
-    time_str = str(pretty_time).strip()
-    if time_str.isdigit() and len(time_str) == 11:
-        return datetime.strptime(time_str, "%Y%j%H%M").strftime("%d/%m/%Y %H:%M")
-    return pretty_time
-
 def get_satellite_info(target_dt):
     if target_dt < GOES_TRANSITION_DATE:
         return "noaa-goes16", "GOES-16"
     return "noaa-goes19", "GOES-19"
+
+ABI_STEP_MINUTES = 10
+
+def floor_to_abi_step(dt):
+    floored_minute = (dt.minute // ABI_STEP_MINUTES) * ABI_STEP_MINUTES
+    return dt.replace(minute=floored_minute, second=0, microsecond=0)
 
 def read_map_geometry_config(config):
     projection = config.get("MAP", "projection").strip().upper()
@@ -125,24 +131,74 @@ def read_map_geometry_config(config):
         "glm_flash_marker_max": flash_marker_max,
     }
 
+def _validate_color(key, raw_value):
+    value = raw_value.strip()
+    if not mcolors.is_color_like(value):
+        raise ValueError(
+            f"{key} não é uma cor reconhecida pelo matplotlib: '{value}' "
+            "(use um hexadecimal #RRGGBB ou um nome válido, ex: 'gray' em vez de 'grey')"
+        )
+    return value
+
 def read_style_config(config):
     watermark_size = config.getfloat("STYLE", "watermark_size")
     if watermark_size <= 0:
         raise ValueError(f"watermark_size deve ser um número positivo, recebido: {watermark_size}")
+
+    borders_color = _validate_color("borders_color", config.get("STYLE", "borders_color"))
+    states_color = _validate_color("states_color", config.get("STYLE", "states_color"))
+    coast_color = _validate_color("coast_color", config.get("STYLE", "coast_color"))
+
+    watermark_color = config.get("STYLE", "watermark_color").strip()
+    if watermark_color:
+        _validate_color("watermark_color", watermark_color)
+
     return {
         "watermark": config.get("STYLE", "watermark"),
-        "watermark_color": config.get("STYLE", "watermark_color").strip(),
+        "watermark_color": watermark_color,
         "watermark_size": watermark_size,
         "clean_mode": config.getboolean("STYLE", "clean_mode"),
-        "borders_color": config.get("STYLE", "borders_color"),
+        "borders_color": borders_color,
         "borders_line_width": config.getfloat("STYLE", "borders_line_width"),
-        "states_color": config.get("STYLE", "states_color"),
+        "states_color": states_color,
         "states_line_width": config.getfloat("STYLE", "states_line_width"),
-        "coast_color": config.get("STYLE", "coast_color"),
+        "coast_color": coast_color,
         "coast_line_width": config.getfloat("STYLE", "coast_line_width"),
         "figure_width": config.getfloat("STYLE", "figure_width"),
         "figure_height": config.getfloat("STYLE", "figure_height"),
     }
+
+def compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi):
+    map_geo = read_map_geometry_config(config)
+    style = read_style_config(config)
+
+    bands_for_palette = set()
+    if is_glm:
+        if glm_background_band:
+            bands_for_palette.add(int(glm_background_band))
+    elif not (1 <= channel_id <= 6):
+        bands_for_palette.add(channel_id)
+
+    palette_data = {}
+    if is_glm:
+        if config.has_section("PALETTE_GLM"):
+            palette_data["GLM"] = sorted(config.items("PALETTE_GLM"))
+    for band_id in sorted(bands_for_palette):
+        section = f"PALETTE_BAND_{band_id:02d}"
+        if config.has_section(section):
+            palette_data[section] = sorted(config.items(section))
+
+    signature_payload = {
+        "channel": "GLM" if is_glm else channel_id,
+        "glm_background_band": glm_background_band if is_glm else None,
+        "dpi": dpi,
+        "map_geo": map_geo,
+        "style": style,
+        "palette_data": palette_data,
+    }
+    payload_json = json.dumps(signature_payload, sort_keys=True, default=str)
+    digest = hashlib.sha1(payload_json.encode("utf-8")).hexdigest()[:12]
+    return digest
 
 def get_projection_params(nc, variable_name="goes_imager_projection"):
     projection_var = nc.variables[variable_name]
@@ -152,11 +208,7 @@ def get_projection_params(nc, variable_name="goes_imager_projection"):
     rpol = getattr(projection_var, "semi_minor_axis", None)
     return height, lon, req, rpol
 
-def compute_image_extent(x_rad, y_rad, sat_height):
-    return (
-        x_rad.min() * sat_height, x_rad.max() * sat_height,
-        y_rad.min() * sat_height, y_rad.max() * sat_height,
-    )
+TITLE_FONTSIZE_PT = 16
 
 TITLE_BAND_LINE_FACTOR = 1.5
 TITLE_BAND_FRAC_MIN = 0.012
@@ -305,8 +357,8 @@ def add_map_title(title_ax, text, fontsize_pt):
     patch = PathPatch(text_path, transform=transform, facecolor="white", edgecolor="none")
     title_ax.add_patch(patch)
 
-def save_figure(fig, png_path, dpi, clean_mode):
-    plt.savefig(png_path, facecolor="black", dpi=dpi)
+def save_figure(fig, png_path, dpi):
+    fig.savefig(png_path, facecolor="black", dpi=dpi)
     fig.clf()
     plt.close(fig)
 
@@ -423,6 +475,33 @@ def acquire_background_lock(lock_path):
             time.sleep(LOCK_POLL_INTERVAL_S)
 
 def release_background_lock(lock_path):
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except OSError:
+        pass
+
+INSTANCE_LOCK_STALE_TIMEOUT_S = 24 * 60 * 60 
+
+def acquire_instance_lock(lock_path):
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(fd, str(time.time()).encode("utf-8"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                lock_time = float(f.read().strip())
+            if time.time() - lock_time > INSTANCE_LOCK_STALE_TIMEOUT_S:
+                log_warning("Lock de instância obsoleto encontrado (execução anterior travou sem limpar). Assumindo e continuando.")
+                os.remove(lock_path)
+                return acquire_instance_lock(lock_path)
+        except Exception:
+            pass
+        return False
+
+def release_instance_lock(lock_path):
     try:
         if os.path.exists(lock_path):
             os.remove(lock_path)

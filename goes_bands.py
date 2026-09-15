@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -8,17 +10,16 @@ import numpy as np
 
 from utils import (
     get_crop_slices,
-    format_pretty_time,
     read_map_geometry_config,
     read_style_config,
     get_projection_params,
-    compute_image_extent,
     create_map_axes,
     add_colorbar_axes,
     add_geo_features,
     add_watermark,
     add_map_title,
     save_figure,
+    TITLE_FONTSIZE_PT,
 )
 
 COLORBAR_FRACTION = 0.03
@@ -47,7 +48,19 @@ THERMAL_BANDS = {
     16: ("Infravermelho - Dióxido de Carbono", "13,27", 10),
 }
 
-TITLE_FONTSIZE_PT = 16
+def format_pretty_time(pretty_time):
+    if not pretty_time:
+        return pretty_time
+    time_str = str(pretty_time).strip()
+    if time_str.isdigit() and len(time_str) == 11:
+        return datetime.strptime(time_str, "%Y%j%H%M").strftime("%d/%m/%Y %H:%M")
+    return pretty_time
+
+def compute_image_extent(x_rad, y_rad, sat_height):
+    return (
+        x_rad.min() * sat_height, x_rad.max() * sat_height,
+        y_rad.min() * sat_height, y_rad.max() * sat_height,
+    )
 
 def is_valid_band(band_id):
     return band_id in REFLECTANCE_BANDS or band_id in THERMAL_BANDS
@@ -158,4 +171,4 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, band_id)
             title_text = f"{sat_name} | C{band_id:02d} — {band_title} ({wavelength} µm) | {pretty_time} UTC"
             add_map_title(title_ax, title_text, TITLE_FONTSIZE_PT)
 
-    save_figure(fig, png_path, dpi, style["clean_mode"])
+    save_figure(fig, png_path, dpi)

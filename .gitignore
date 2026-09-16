@@ -1,11 +1,10 @@
 # Cache de bytecode do Python
 __pycache__/
-*.pyc
 
-# Script pessoal de execução
+# Script pessoal pra execução
 gerarImagensDeSatelite.sh
 
-# Pastas geradas em tempo de execução (saída e cache)
+# Pastas geradas pelo script
 satelite_images/
 satelite_videos/
 satelite_temp_images/

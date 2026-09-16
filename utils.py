@@ -1,7 +1,4 @@
-import hashlib
-import json
 import os
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -17,7 +14,6 @@ from matplotlib.patches import PathPatch
 from matplotlib.font_manager import FontProperties
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-import numpy as np
 
 GOES_TRANSITION_DATE = datetime(2025, 4, 7, tzinfo=timezone.utc)
 
@@ -27,23 +23,16 @@ LOCK_STALE_TIMEOUT_S = 300
 TEMP_NC_DIR = "satelite_temp_downloads"
 GLM_NC_CACHE_DIR = os.path.join(TEMP_NC_DIR, "glm_nc_cache")
 ABI_REQUIRED_VARS = ["CMI"]
-GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
 
-_LOG_COLLECTOR = None
-
-def configure_log_collector(shared_list):
-    global _LOG_COLLECTOR
-    _LOG_COLLECTOR = shared_list
+LOG_COLLECTOR_STATE = {"collector": None}
 
 def _record_log(level, message):
-    if _LOG_COLLECTOR is not None:
+    collector = LOG_COLLECTOR_STATE["collector"]
+    if collector is not None:
         try:
-            _LOG_COLLECTOR.append((level, message))
+            collector.append((level, message))
         except Exception:
             pass
-
-def log_fatal(message):
-    print(f"☠️ ERRO FATAL: {message}")
 
 def log_error(message):
     print(f"❌ ERRO: {message}")
@@ -53,40 +42,8 @@ def log_warning(message):
     print(f"⚠️ AVISO: {message}")
     _record_log("AVISO", message)
 
-def log_success(message):
-    print(f"✅ {message}")
-
 def log_info(message):
     print(f"ℹ️ {message}")
-
-def exit_fatal(message):
-    log_fatal(message)
-    sys.exit(1)
-
-def format_elapsed_time(seconds):
-    if seconds < 1:
-        return f"{seconds:.2f}s"
-    minutes, secs = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f"{hours}h {minutes}m {secs}s"
-    if minutes > 0:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
-
-def parse_datetime(date_str, time_str, require_seconds):
-    full_str = f"{date_str} {time_str}"
-    has_seconds = time_str.count(":") == 2
-    if require_seconds and not has_seconds:
-        raise ValueError(
-            f"horário '{time_str}' sem segundos: canal GLM exige o formato HH:MM:SS"
-        )
-    if not require_seconds and has_seconds:
-        raise ValueError(
-            f"horário '{time_str}' com segundos: canal ABI exige o formato HH:MM, sem segundos"
-        )
-    time_format = "%H:%M:%S" if has_seconds else "%H:%M"
-    return datetime.strptime(full_str, f"%Y-%m-%d {time_format}").replace(tzinfo=timezone.utc)
 
 def get_satellite_info(target_dt):
     if target_dt < GOES_TRANSITION_DATE:
@@ -167,38 +124,6 @@ def read_style_config(config):
         "figure_width": config.getfloat("STYLE", "figure_width"),
         "figure_height": config.getfloat("STYLE", "figure_height"),
     }
-
-def compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi):
-    map_geo = read_map_geometry_config(config)
-    style = read_style_config(config)
-
-    bands_for_palette = set()
-    if is_glm:
-        if glm_background_band:
-            bands_for_palette.add(int(glm_background_band))
-    elif not (1 <= channel_id <= 6):
-        bands_for_palette.add(channel_id)
-
-    palette_data = {}
-    if is_glm:
-        if config.has_section("PALETTE_GLM"):
-            palette_data["GLM"] = sorted(config.items("PALETTE_GLM"))
-    for band_id in sorted(bands_for_palette):
-        section = f"PALETTE_BAND_{band_id:02d}"
-        if config.has_section(section):
-            palette_data[section] = sorted(config.items(section))
-
-    signature_payload = {
-        "channel": "GLM" if is_glm else channel_id,
-        "glm_background_band": glm_background_band if is_glm else None,
-        "dpi": dpi,
-        "map_geo": map_geo,
-        "style": style,
-        "palette_data": palette_data,
-    }
-    payload_json = json.dumps(signature_payload, sort_keys=True, default=str)
-    digest = hashlib.sha1(payload_json.encode("utf-8")).hexdigest()[:12]
-    return digest
 
 def get_projection_params(nc, variable_name="goes_imager_projection"):
     projection_var = nc.variables[variable_name]
@@ -292,17 +217,6 @@ def create_map_axes(projection_type, sat_lon, sat_height, clean_mode, target_coo
 
     return fig, ax, geo_proj, title_ax, map_width_frac
 
-COLORBAR_VERTICAL_MARGIN_FRAC = 0.02
-
-def add_colorbar_axes(fig, ax, fraction=0.03, pad=0.04):
-    map_pos = ax.get_position()
-    cbar_width = map_pos.width * fraction
-    cbar_pad = map_pos.width * pad
-    cbar_y0 = map_pos.y0 + map_pos.height * COLORBAR_VERTICAL_MARGIN_FRAC
-    cbar_height = map_pos.height * (1.0 - 2 * COLORBAR_VERTICAL_MARGIN_FRAC)
-    cax = fig.add_axes([map_pos.x1 + cbar_pad, cbar_y0, cbar_width, cbar_height])
-    return cax
-
 def add_geo_features(ax, style):
     ax.add_feature(cfeature.STATES.with_scale("10m"), linewidth=style["states_line_width"],
                     edgecolor=style["states_color"], alpha=0.7, zorder=2)
@@ -362,93 +276,11 @@ def save_figure(fig, png_path, dpi):
     fig.clf()
     plt.close(fig)
 
-def _lonlat_to_scan_angle(lon, lat, sat_lon, sat_height_total, req, rpol):
-    lam0 = np.radians(sat_lon)
-    phi = np.radians(lat)
-    lam = np.radians(lon)
-    e2 = 1.0 - (rpol ** 2) / (req ** 2)
-    phi_c = np.arctan((rpol ** 2 / req ** 2) * np.tan(phi))
-    rc = rpol / np.sqrt(1.0 - e2 * np.cos(phi_c) ** 2)
-    sx = sat_height_total - rc * np.cos(phi_c) * np.cos(lam - lam0)
-    sy = -rc * np.cos(phi_c) * np.sin(lam - lam0)
-    sz = rc * np.sin(phi_c)
-    y = np.arctan(sz / sx)
-    x = np.arcsin(-sy / np.sqrt(sx ** 2 + sy ** 2 + sz ** 2))
-    return x, y
-
-def get_crop_slices(nc, target_coords, margin_frac=0.05, min_margin_px=6):
-    lon_w, lon_e, lat_s, lat_n = target_coords
-    proj = nc.variables["goes_imager_projection"]
-    sat_lon = proj.longitude_of_projection_origin
-    req = proj.semi_major_axis
-    rpol = proj.semi_minor_axis
-    sat_height_total = proj.perspective_point_height + req
-    corner_lons = np.array([lon_w, lon_w, lon_e, lon_e])
-    corner_lats = np.array([lat_s, lat_n, lat_s, lat_n])
-    xs, ys = _lonlat_to_scan_angle(corner_lons, corner_lats, sat_lon, sat_height_total, req, rpol)
-    valid = np.isfinite(xs) & np.isfinite(ys)
-    if not valid.any():
-        return slice(None), slice(None)
-    xs, ys = xs[valid], ys[valid]
-    x_rad = nc.variables["x"][:]
-    y_rad = nc.variables["y"][:]
-    col_start_raw = int(np.searchsorted(x_rad, xs.min(), side="left"))
-    col_end_raw = int(np.searchsorted(x_rad, xs.max(), side="right"))
-    y_desc = y_rad[::-1]
-    row_start_desc = int(np.searchsorted(y_desc, ys.min(), side="left"))
-    row_end_desc = int(np.searchsorted(y_desc, ys.max(), side="right"))
-    n_y = len(y_rad)
-    row_start_raw = n_y - row_end_desc
-    row_end_raw = n_y - row_start_desc
-    margin_cols = max(min_margin_px, int((col_end_raw - col_start_raw) * margin_frac))
-    margin_rows = max(min_margin_px, int((row_end_raw - row_start_raw) * margin_frac))
-    col_start = max(col_start_raw - margin_cols, 0)
-    col_end = min(col_end_raw + margin_cols, len(x_rad))
-    row_start = max(row_start_raw - margin_rows, 0)
-    row_end = min(row_end_raw + margin_rows, n_y)
-    return slice(row_start, row_end), slice(col_start, col_end)
-
 def glm_nc_cache_paths(cache_dir, remote_path):
     base_name = os.path.basename(remote_path).replace(".nc", "")
     cache_data = os.path.join(cache_dir, f"glm_{base_name}.nc")
     lock_path = os.path.join(cache_dir, f"glm_{base_name}.lock")
     return cache_data, lock_path
-
-def background_cache_paths(cache_dir, satellite_bucket, band_id, background_dt):
-    time_key = background_dt.strftime("%Y%j%H%M")
-    base_name = f"bg_{satellite_bucket}_C{band_id:02d}_{time_key}"
-    cache_data = os.path.join(cache_dir, f"{base_name}.npz")
-    lock_path = os.path.join(cache_dir, f"{base_name}.lock")
-    return cache_data, lock_path
-
-def save_background_data(cache_data_path, band_data):
-    np.savez_compressed(
-        cache_data_path,
-        is_reflectance=band_data["is_reflectance"],
-        data=band_data["data"],
-        img_extent=np.asarray(band_data["img_extent"], dtype="float64"),
-        vmin=band_data["vmin"],
-        vmax=band_data["vmax"],
-        sat_h=band_data["sat_h"],
-        sat_lon=band_data["sat_lon"],
-        sat_req=band_data["sat_req"],
-        sat_rpol=band_data["sat_rpol"],
-    )
-
-def load_background_data(cache_data_path):
-    with np.load(cache_data_path) as npz:
-        is_reflectance = bool(npz["is_reflectance"])
-        return {
-            "is_reflectance": is_reflectance,
-            "data": npz["data"],
-            "img_extent": tuple(npz["img_extent"].tolist()),
-            "vmin": float(npz["vmin"]),
-            "vmax": float(npz["vmax"]),
-            "sat_h": float(npz["sat_h"]),
-            "sat_lon": float(npz["sat_lon"]),
-            "sat_req": float(npz["sat_req"]),
-            "sat_rpol": float(npz["sat_rpol"]),
-        }
 
 def acquire_background_lock(lock_path):
     start = time.time()
@@ -475,33 +307,6 @@ def acquire_background_lock(lock_path):
             time.sleep(LOCK_POLL_INTERVAL_S)
 
 def release_background_lock(lock_path):
-    try:
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except OSError:
-        pass
-
-INSTANCE_LOCK_STALE_TIMEOUT_S = 24 * 60 * 60 
-
-def acquire_instance_lock(lock_path):
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.write(fd, str(time.time()).encode("utf-8"))
-        os.close(fd)
-        return True
-    except FileExistsError:
-        try:
-            with open(lock_path, "r", encoding="utf-8") as f:
-                lock_time = float(f.read().strip())
-            if time.time() - lock_time > INSTANCE_LOCK_STALE_TIMEOUT_S:
-                log_warning("Lock de instância obsoleto encontrado (execução anterior travou sem limpar). Assumindo e continuando.")
-                os.remove(lock_path)
-                return acquire_instance_lock(lock_path)
-        except Exception:
-            pass
-        return False
-
-def release_instance_lock(lock_path):
     try:
         if os.path.exists(lock_path):
             os.remove(lock_path)

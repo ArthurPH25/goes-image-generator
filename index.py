@@ -1,5 +1,7 @@
 import configparser
 import gc
+import hashlib
+import json
 import os
 import platform
 import shutil
@@ -26,30 +28,133 @@ import s3fs
 import goes_bands
 import GLM
 from utils import (
-    format_elapsed_time,
-    parse_datetime,
     get_satellite_info,
     log_error,
     log_warning,
-    log_success,
     log_info,
-    exit_fatal,
     glm_nc_cache_paths,
     acquire_background_lock,
     release_background_lock,
-    acquire_instance_lock,
-    release_instance_lock,
-    configure_log_collector,
-    compute_render_signature,
+    LOG_COLLECTOR_STATE,
     floor_to_abi_step,
+    read_map_geometry_config,
+    read_style_config,
     TEMP_NC_DIR,
     GLM_NC_CACHE_DIR,
     ABI_REQUIRED_VARS,
-    GLM_REQUIRED_VARS,
 )
 from S3_downloader import download_batch
 
 warnings.filterwarnings("ignore")
+
+GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
+INSTANCE_LOCK_STALE_TIMEOUT_S = 24 * 60 * 60
+
+def configure_log_collector(shared_list):
+    LOG_COLLECTOR_STATE["collector"] = shared_list
+
+def log_fatal(message):
+    print(f"☠️ ERRO FATAL: {message}")
+
+def exit_fatal(message):
+    log_fatal(message)
+    sys.exit(1)
+
+def log_success(message):
+    print(f"✅ {message}")
+
+def format_elapsed_time(seconds):
+    if seconds < 1:
+        return f"{seconds:.2f}s"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes > 0:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+def parse_datetime(date_str, time_str, require_seconds):
+    full_str = f"{date_str} {time_str}"
+    has_seconds = time_str.count(":") == 2
+    if require_seconds and not has_seconds:
+        raise ValueError(
+            f"horário '{time_str}' sem segundos: canal GLM exige o formato HH:MM:SS"
+        )
+    if not require_seconds and has_seconds:
+        raise ValueError(
+            f"horário '{time_str}' com segundos: canal ABI exige o formato HH:MM, sem segundos"
+        )
+    time_format = "%H:%M:%S" if has_seconds else "%H:%M"
+    return datetime.strptime(full_str, f"%Y-%m-%d {time_format}").replace(tzinfo=timezone.utc)
+
+def get_unique_path(desired_path):
+    if not os.path.exists(desired_path):
+        return desired_path
+    base, ext = os.path.splitext(desired_path)
+    counter = 2
+    while True:
+        candidate = f"{base} ({counter}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+def acquire_instance_lock(lock_path):
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(fd, str(time.time()).encode("utf-8"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                lock_time = float(f.read().strip())
+            if time.time() - lock_time > INSTANCE_LOCK_STALE_TIMEOUT_S:
+                log_warning("Lock de instância obsoleto encontrado (execução anterior travou sem limpar). Assumindo e continuando.")
+                os.remove(lock_path)
+                return acquire_instance_lock(lock_path)
+        except Exception:
+            pass
+        return False
+
+def release_instance_lock(lock_path):
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except OSError:
+        pass
+
+def compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi):
+    map_geo = read_map_geometry_config(config)
+    style = read_style_config(config)
+
+    bands_for_palette = set()
+    if is_glm:
+        if glm_background_band:
+            bands_for_palette.add(int(glm_background_band))
+    elif not (1 <= channel_id <= 6):
+        bands_for_palette.add(channel_id)
+
+    palette_data = {}
+    if is_glm:
+        if config.has_section("PALETTE_GLM"):
+            palette_data["GLM"] = sorted(config.items("PALETTE_GLM"))
+    for band_id in sorted(bands_for_palette):
+        section = f"PALETTE_BAND_{band_id:02d}"
+        if config.has_section(section):
+            palette_data[section] = sorted(config.items(section))
+
+    signature_payload = {
+        "channel": "GLM" if is_glm else channel_id,
+        "glm_background_band": glm_background_band if is_glm else None,
+        "dpi": dpi,
+        "map_geo": map_geo,
+        "style": style,
+        "palette_data": palette_data,
+    }
+    payload_json = json.dumps(signature_payload, sort_keys=True, default=str)
+    digest = hashlib.sha1(payload_json.encode("utf-8")).hexdigest()[:12]
+    return digest
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.ini")
@@ -86,6 +191,7 @@ try:
     ffmpeg_preset = config.get("FFMPEG", "preset")
 
     glm_background_band = config.get("MAP", "glm_background_band").strip()
+    clean_mode_active = config.getboolean("STYLE", "clean_mode")
 
     render_signature = compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi)
     run_temp_dir = os.path.join(TEMP_IMAGES_DIR, render_signature)
@@ -140,6 +246,8 @@ def build_png_name(remote_file):
     png_name = remote_file.split("/")[-1].replace(".nc", ".png")
     if is_glm and glm_background_band:
         png_name = png_name.replace(".png", f"_C{int(glm_background_band):02d}.png")
+    if gen_type == "I" and clean_mode_active:
+        png_name = png_name.replace(".png", "_clean.png")
     return png_name
 
 def _is_valid_png(path):
@@ -162,6 +270,9 @@ def process_file_worker(args):
     try:
         file_name = remote_file.split("/")[-1]
         png_path = os.path.join(output_path, build_png_name(remote_file))
+
+        if current_gen_type == "I":
+            png_path = get_unique_path(png_path)
 
         if is_glm:
             pretty_time = target_dt.strftime("%Y%j%H%M%S")
@@ -409,6 +520,7 @@ def process_satellite():
                     if video_frames:
                         time_fmt_out = "%Y%m%d_%H%M%S" if is_glm else "%Y%m%d_%H%M"
                         video_filename = os.path.join(VIDEOS_DIR, f"satelite_{target_dates[0].strftime(time_fmt_out)}_ate_{target_dates[-1].strftime(time_fmt_out)}_fps{video_fps}.mp4")
+                        video_filename = get_unique_path(video_filename)
                         ffmpeg_args = ['-crf', str(crf_value), '-preset', ffmpeg_preset, '-vf', video_scale, '-loglevel', 'error']
 
                         log_info(f"Codificando com FFmpeg (CRF {crf_value}, scale {video_scale}).")

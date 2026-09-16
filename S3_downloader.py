@@ -5,7 +5,6 @@ import os
 import random
 
 import s3fs
-from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, EndpointConnectionError
 from netCDF4 import Dataset
 
@@ -18,9 +17,6 @@ MIN_VALID_FILE_SIZE_BYTES = 8 * 1024
 MAX_RETRIES = 5
 BASE_BACKOFF_S = 1.5
 MAX_BACKOFF_S = 30.0
-
-class DownloadError(Exception):
-    pass
 
 def _is_not_found_error(exc: Exception) -> bool:
     if isinstance(exc, FileNotFoundError):

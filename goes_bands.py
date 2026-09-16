@@ -3,18 +3,15 @@ from datetime import datetime
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
 import matplotlib.colors as mcolors
 from netCDF4 import Dataset
 import numpy as np
 
 from utils import (
-    get_crop_slices,
     read_map_geometry_config,
     read_style_config,
     get_projection_params,
     create_map_axes,
-    add_colorbar_axes,
     add_geo_features,
     add_watermark,
     add_map_title,
@@ -25,6 +22,62 @@ from utils import (
 COLORBAR_FRACTION = 0.03
 COLORBAR_PAD = 0.04
 COLORBAR_LABEL_RESERVE = 0.06
+COLORBAR_VERTICAL_MARGIN_FRAC = 0.02
+
+def add_colorbar_axes(fig, ax, fraction=0.03, pad=0.04):
+    map_pos = ax.get_position()
+    cbar_width = map_pos.width * fraction
+    cbar_pad = map_pos.width * pad
+    cbar_y0 = map_pos.y0 + map_pos.height * COLORBAR_VERTICAL_MARGIN_FRAC
+    cbar_height = map_pos.height * (1.0 - 2 * COLORBAR_VERTICAL_MARGIN_FRAC)
+    cax = fig.add_axes([map_pos.x1 + cbar_pad, cbar_y0, cbar_width, cbar_height])
+    return cax
+
+def _lonlat_to_scan_angle(lon, lat, sat_lon, sat_height_total, req, rpol):
+    lam0 = np.radians(sat_lon)
+    phi = np.radians(lat)
+    lam = np.radians(lon)
+    e2 = 1.0 - (rpol ** 2) / (req ** 2)
+    phi_c = np.arctan((rpol ** 2 / req ** 2) * np.tan(phi))
+    rc = rpol / np.sqrt(1.0 - e2 * np.cos(phi_c) ** 2)
+    sx = sat_height_total - rc * np.cos(phi_c) * np.cos(lam - lam0)
+    sy = -rc * np.cos(phi_c) * np.sin(lam - lam0)
+    sz = rc * np.sin(phi_c)
+    y = np.arctan(sz / sx)
+    x = np.arcsin(-sy / np.sqrt(sx ** 2 + sy ** 2 + sz ** 2))
+    return x, y
+
+def get_crop_slices(nc, target_coords, margin_frac=0.05, min_margin_px=6):
+    lon_w, lon_e, lat_s, lat_n = target_coords
+    proj = nc.variables["goes_imager_projection"]
+    sat_lon = proj.longitude_of_projection_origin
+    req = proj.semi_major_axis
+    rpol = proj.semi_minor_axis
+    sat_height_total = proj.perspective_point_height + req
+    corner_lons = np.array([lon_w, lon_w, lon_e, lon_e])
+    corner_lats = np.array([lat_s, lat_n, lat_s, lat_n])
+    xs, ys = _lonlat_to_scan_angle(corner_lons, corner_lats, sat_lon, sat_height_total, req, rpol)
+    valid = np.isfinite(xs) & np.isfinite(ys)
+    if not valid.any():
+        return slice(None), slice(None)
+    xs, ys = xs[valid], ys[valid]
+    x_rad = nc.variables["x"][:]
+    y_rad = nc.variables["y"][:]
+    col_start_raw = int(np.searchsorted(x_rad, xs.min(), side="left"))
+    col_end_raw = int(np.searchsorted(x_rad, xs.max(), side="right"))
+    y_desc = y_rad[::-1]
+    row_start_desc = int(np.searchsorted(y_desc, ys.min(), side="left"))
+    row_end_desc = int(np.searchsorted(y_desc, ys.max(), side="right"))
+    n_y = len(y_rad)
+    row_start_raw = n_y - row_end_desc
+    row_end_raw = n_y - row_start_desc
+    margin_cols = max(min_margin_px, int((col_end_raw - col_start_raw) * margin_frac))
+    margin_rows = max(min_margin_px, int((row_end_raw - row_start_raw) * margin_frac))
+    col_start = max(col_start_raw - margin_cols, 0)
+    col_end = min(col_end_raw + margin_cols, len(x_rad))
+    row_start = max(row_start_raw - margin_rows, 0)
+    row_end = min(row_end_raw + margin_rows, n_y)
+    return slice(row_start, row_end), slice(col_start, col_end)
 
 REFLECTANCE_BANDS = {
     1: ("Visível Azul", "0,47"),

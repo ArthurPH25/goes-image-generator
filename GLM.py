@@ -4,10 +4,10 @@ from datetime import timedelta
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import matplotlib.patches as mpatches
 from netCDF4 import Dataset
+import numpy as np
 import s3fs
 
 import goes_bands
@@ -24,9 +24,6 @@ from utils import (
     log_error,
     log_warning,
     log_info,
-    background_cache_paths,
-    save_background_data,
-    load_background_data,
     acquire_background_lock,
     release_background_lock,
     glm_nc_cache_paths,
@@ -36,9 +33,45 @@ from utils import (
     TITLE_FONTSIZE_PT,
     floor_to_abi_step,
 )
-from S3_downloader import download_batch, download_batch_async, CONNECT_TIMEOUT_S, READ_TIMEOUT_S
+from S3_downloader import download_batch, CONNECT_TIMEOUT_S, READ_TIMEOUT_S
 
 BACKGROUND_CACHE_DIR = TEMP_NC_DIR
+
+def background_cache_paths(cache_dir, satellite_bucket, band_id, background_dt):
+    time_key = background_dt.strftime("%Y%j%H%M")
+    base_name = f"bg_{satellite_bucket}_C{band_id:02d}_{time_key}"
+    cache_data = os.path.join(cache_dir, f"{base_name}.npz")
+    lock_path = os.path.join(cache_dir, f"{base_name}.lock")
+    return cache_data, lock_path
+
+def save_background_data(cache_data_path, band_data):
+    np.savez_compressed(
+        cache_data_path,
+        is_reflectance=band_data["is_reflectance"],
+        data=band_data["data"],
+        img_extent=np.asarray(band_data["img_extent"], dtype="float64"),
+        vmin=band_data["vmin"],
+        vmax=band_data["vmax"],
+        sat_h=band_data["sat_h"],
+        sat_lon=band_data["sat_lon"],
+        sat_req=band_data["sat_req"],
+        sat_rpol=band_data["sat_rpol"],
+    )
+
+def load_background_data(cache_data_path):
+    with np.load(cache_data_path) as npz:
+        is_reflectance = bool(npz["is_reflectance"])
+        return {
+            "is_reflectance": is_reflectance,
+            "data": npz["data"],
+            "img_extent": tuple(npz["img_extent"].tolist()),
+            "vmin": float(npz["vmin"]),
+            "vmax": float(npz["vmax"]),
+            "sat_h": float(npz["sat_h"]),
+            "sat_lon": float(npz["sat_lon"]),
+            "sat_req": float(npz["sat_req"]),
+            "sat_rpol": float(npz["sat_rpol"]),
+        }
 
 def _get_color_for_age(age_seconds, sorted_colors):
     chosen_color = sorted_colors[0][1]

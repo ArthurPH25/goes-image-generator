@@ -1,152 +1,71 @@
 # GOES Image Generator
 
-Gerador de imagens e vídeos a partir de dados brutos dos satélites GOES-16 e GOES-19 (NOAA), otimizado para a **América do Sul**. Renderiza as 16 bandas espectrais do ABI e o mapeador de raios GLM, com colormaps, projeção cartográfica e estilização customizáveis via `.ini`.
+Gerador de imagens estáticas e vídeos a partir dos satélites GOES-16/GOES-19 (bandas ABI 1-16 e GLM), com foco na América do Sul. Baixa os NetCDF direto do bucket público da NOAA na AWS, recorta a região de interesse, aplica as paletas definidas em `colors.ini` e renderiza com matplotlib/cartopy, seja para uma imagem única ou para um vídeo compilado com FFmpeg.
 
-O script baixa os NetCDF direto do bucket público S3 da NOAA (`noaa-goes16` / `noaa-goes19`), recorta a região escolhida, aplica a paleta de cores correspondente e renderiza com `matplotlib` + `cartopy`. A saída é um PNG avulso ou um MP4 (montado via `ffmpeg`/`imageio` a partir da sequência de frames).
+Toda a configuração de execução (canal, período, geometria do mapa, cores, performance) fica em `config.ini`/`colors.ini`, os dois comentados linha a linha. Este README cobre o que os `.ini` não cobrem: como o pipeline funciona por dentro e o que esperar quando as coisas dão errado.
 
----
+## Arquitetura e fluxo do pipeline
 
-## Arquitetura
+### 1. Validação e assinatura de render (`index.py`, nível de módulo)
 
-Orquestração em `index.py`:
+O parsing e a validação de `config.ini`/`colors.ini` rodam no nível de módulo, fora de qualquer função, antes do `if __name__ == "__main__"`. Qualquer erro de config aborta (`exit_fatal`) antes de tocar em rede ou subir um worker.
 
-1. **Validação** — `config.ini` inteiro (`[GENERAL]`, `[IMAGE_TIME]`/`[VIDEO_TIME]`, `[MAP]` e `[STYLE]`) é parseado e validado antes de qualquer busca ou download, inclusive para calcular a assinatura de cache do vídeo. Chave errada ou faltando derruba o script na hora, sem gastar uma única requisição no S3. A única validação que sobra pra dentro do worker é a paleta de cores em `colors.ini` (ex: chave não-inteira em `[PALETTE_BAND_XX]`) — um erro nela só aparece depois que a busca no S3 já rodou, porque o script só lê a paleta de fato ao renderizar o primeiro frame.
-2. **Busca no S3** — localização dos arquivos no bucket. Troca automaticamente de satélite: GOES-16 até 07/04/2025, GOES-19 depois disso.
-3. **Download assíncrono** — `S3_downloader.py` baixa via `asyncio` + `s3fs`, com retry exponencial, checagem de integridade e tratamento de 404.
-4. **Renderização**:
-   - `goes_bands.py` — as 16 bandas ABI (refletância em escala de cinza ou paleta térmica customizada), com recorte de mapa e overlays.
-   - `GLM.py` — densidade de raios GLM, com rastro histórico (idade codificada por cor e tamanho de marcador) e overlay opcional sobre fundo ABI (com cache compartilhado entre frames).
-5. **Paralelização** — frames processados via `ProcessPoolExecutor` (CPU); downloads de cada frame rodam concorrentemente via `asyncio` (I/O).
-6. **Vídeo** — se `generation_type = V`, `imageio`/`ffmpeg` costura os frames em `.mp4` com controle de CRF, preset e escala.
-7. **Encerramento** — o script imprime tempo de execução por etapa e um relatório consolidado de avisos (⚠️) e erros (❌) não fatais, incluindo os que rodaram nos workers. Erros fatais (☠️) não entram nesse relatório porque já interrompem o script na hora.
+Nessa mesma etapa é calculada a `render_signature`: um SHA1 (12 chars) de tudo que afeta a aparência do frame, isto é, canal, `[MAP]` (projeção, coordenadas, tamanho da bolinha do raio), `[STYLE]` inteiro, `dpi`, banda de fundo do GLM e as seções de paleta relevantes ao canal ativo. Data e horário **não** entram na assinatura, de propósito.
 
-`utils.py` concentra o que é compartilhado entre os módulos: validação de config, projeção geoestacionária, recorte de área, marca d'água, título e o file lock que evita dois workers renderizando o mesmo fundo GLM ao mesmo tempo.
+Essa assinatura decide a pasta de trabalho do modo vídeo (`satelite_temp_images/<assinatura>/`):
+- Mudar só o período do vídeo (`start_time`/`end_time`) mantém a mesma assinatura, então frames já renderizados são reaproveitados e só os timestamps novos são processados.
+- Mudar qualquer coisa visual (cor, projeção, canal, dpi...) gera assinatura nova, então a pasta é criada do zero.
 
----
+No modo imagem única (`I`) essa lógica nem entra em jogo: a saída vai direto pra `satelite_images/`, sem cache entre execuções.
 
-## Foco regional: América do Sul
+### 2. Busca no S3 (síncrona, fora do pool)
 
-- **Satélite de referência**: GOES-19 (75°W) cobre o continente desde abril de 2025; datas anteriores usam GOES-16 automaticamente.
-- **Recorte**: `target_coordinates` (Oeste, Leste, Sul, Norte) recorta só a área de interesse — menos CPU/RAM e arquivos de saída mais leves.
-- **Fuso horário**: tudo em UTC — busca no bucket, timestamps, títulos e nomes de arquivo.
-- **Cadência**: segue o Full Disk real — 10 minutos para ABI, 20 segundos para GLM.
+A NOAA não expõe nome de arquivo previsível, então o timestamp exato é resolvido listando a pasta da hora (`s3fs.ls`) e filtrando por prefixo/canal. Essa busca roda sequencial e sincronamente no processo principal, um `ls` por timestamp-alvo (e mais um `ls` na pasta ABI, se `glm_background_band` estiver setado). Não há paralelismo aqui de propósito: listar é rápido, e paralelizar isso só aumentaria a chance de throttle da NOAA logo no início da execução.
 
----
+### 3. Renderização (`ProcessPoolExecutor`, paralelismo misto)
 
-## Configuração
+Cada timestamp resolvido vira uma tarefa distribuída entre `num_workers` processos. Dentro de cada worker o fluxo é sequencial:
 
-Dois arquivos `.ini` na raiz do projeto:
+1. Download do NetCDF principal via `S3_downloader.download_batch`, que sobe seu próprio `asyncio.run()` com um semáforo de `max_concurrent_downloads`.
+2. Render com matplotlib/cartopy (`goes_bands.py` ou `GLM.py`), que é CPU-bound e por isso os workers são processos, não threads.
 
-- **`config.ini`** — canal, período, workers, projeção, recorte, GLM e renderização de vídeo.
-- **`colors.ini`** — paletas hexadecimais por banda térmica e por idade de raio GLM.
+Pro canal GLM, o worker ainda dispara um **segundo** `asyncio.run()` (dentro de `GLM.generate_image` → `_fetch_flash_history`) pra buscar o histórico de raios (`glm_history_lookback_steps` passos de 20s pra trás), com semáforo próprio (`glm_history_max_concurrent_downloads`). Os dois `asyncio.run()` do worker (download principal e histórico) rodam em sequência, não simultaneamente.
 
-Não há valores padrão implícitos: chave ausente ou fora do formato esperado interrompe o script. Isso vale para as chaves realmente usadas no modo ativo — `[IMAGE_TIME]` só é lida se `generation_type = I`, `[VIDEO_TIME]` só se `generation_type = V` (a seção do modo inativo pode ficar com qualquer coisa, ela nem é tocada).
+`goes_bands.py` e `GLM.py` só extraem a banda/os raios e desenham; projeção geoestacionária↔lat/lon, geometria da figura, título, marca d'água e os locks de arquivo ficam centralizados em `utils.py`.
 
-### Pontos de atenção (comportamento real, não intuitivo)
+### 4. Montagem do vídeo
 
-1. **Horário ABI vs. GLM** — ABI usa `HH:MM`; GLM usa `HH:MM:SS`. Trocar `channel` exige ajustar o formato do horário correspondente, senão a validação quebra.
-2. **Ordem das coordenadas** — o script confere se `target_coordinates` tem 4 números, mas não checa se Oeste < Leste e Sul < Norte. Inverter os valores passa na validação e sai com o mapa cortado errado.
-3. **Timestamp ausente no bucket**: no modo vídeo (`V`), o frame ausente é pulado com aviso no console e o vídeo segue sem ele. No modo imagem única (`I`), se o instante pedido não existir, o script encerra com **erro fatal** — não há frame de fallback nesse modo.
-4. **Modo imagem única sobrescreve sem perguntar** — diferente do modo vídeo (que reaproveita frame já existente no cache), o modo `I` sempre re-renderiza e sobrescreve o PNG de saída, mesmo se já existir um com o mesmo nome.
-5. **`fps` do `config.ini` só vale para vídeo** — no modo `I` a seção `[VIDEO_TIME]` inteira nem é lida, então o `fps` configurado não tem efeito nenhum nesse modo (não aparece em lugar algum, nem como metadado).
-6. **`glm_flash_age = False` desliga tudo** — só mostra os raios do segundo exato do frame. O rastro histórico morre, a legenda some e `glm_history_lookback_steps` fica sem efeito.
-7. **Sufixo de cache `_CXX` no GLM** — preencher `glm_background_band` adiciona a banda no nome do frame (`_C13.png`). Banda inválida (fora de 1–16) só estoura erro **depois** que o arquivo GLM principal já foi baixado.
-8. **Lag do fundo GLM (não é bug)** — ABI atualiza a cada 10 min, GLM a cada 20s. O fundo sempre arredonda **para trás** pro múltiplo de 10 anterior — um raio das 19:19:40 usa o fundo ABI das 19:10 (lag de até 9min40s). É limitação física do satélite, não do script.
-9. **Lock de fundo em vídeos GLM** — com `num_workers` alto (12+) e fundo ABI habilitado, um worker pode esperar mais de 5 minutos pela renderização do fundo por outro worker. Se estourar, o frame sai sem fundo com aviso amarelo. Se acontecer com frequência, abaixe `num_workers`. O download do *histórico* de raios (não o fundo ABI) tem uma diferença sutil aqui: se o lock dele estourar, o script tenta baixar mesmo assim (é seguro — usa arquivo temporário por processo e troca atômica), então nunca fica sem histórico por causa de lock, só sem fundo ABI.
-10. **Isolamento de `satelite_temp_images/<assinatura>/`** — cada combinação de parâmetros que afeta o pixel final (canal, `target_coordinates`, `projection`, `dpi`, tudo em `[STYLE]`, paletas de cor envolvidas) gera um subdiretório próprio, calculado no início da execução. Rodar de novo com os mesmos parâmetros reaproveita o cache (útil pra retomar vídeo interrompido); mudar qualquer parâmetro visual cai num subdiretório novo. Com `delete_temp_images = True`, só o subdiretório **desta execução** é apagado ao final. Pra limpar cache acumulado de execuções antigas, apague `satelite_temp_images/` inteira — ela é recriada na próxima execução.
-11. **Proporção do título** — a barra do título tem altura fixa em polegadas (quando `clean_mode = False`). Se a imagem parecer "engolida" pelo título, aumente `figure_height`.
-12. **Arquivo corrompido** — downloads com menos de 8 KB são tratados como truncados e descartados na hora. Se o script insistir em rebaixar o mesmo arquivo várias vezes numa conexão ruim, é isso acontecendo.
-13. **Uma instância por pasta** — `satelite_temp_downloads/` (cache de `.nc` e do fundo GLM) não é isolado por assinatura de render como `satelite_temp_images/<assinatura>/` é, e é apagado por inteiro ao final de cada execução. Rodar duas instâncias do script ao mesmo tempo na mesma pasta faz uma apagar o cache compartilhado da outra em pleno voo. O script trava isso sozinho: a segunda instância recebe um erro fatal imediato ao tentar iniciar, antes de baixar qualquer coisa. Para rodar duas gerações em paralelo, use pastas (cópias do repositório) separadas.
-14. **Retomada de vídeo valida o PNG, não só a existência dele** — se uma execução anterior for interrompida no meio da gravação de um frame (Ctrl+C, falta de energia, OOM), o cache de retomada do modo vídeo detecta o PNG truncado e re-renderiza o frame em vez de aceitá-lo cego; o mesmo vale na hora de montar o `.mp4` final, onde frames corrompidos são descartados com aviso em vez de derrubar a montagem inteira.
+Depois que todos os workers terminam, o vídeo é montado fora do pool (processo principal), lendo os PNGs da pasta de assinatura, validando cada um e entregando pro FFmpeg via `imageio`.
 
----
+## Comportamentos e casos de borda
 
-## Pré-requisitos
+**Cache do fundo ABI no GLM: por bloco de 10 min, com lock, só existe em vídeo.** Quando `glm_background_band` está configurado, todo frame GLM cujo timestamp caia no mesmo bloco de 10 minutos aponta pro mesmo `.npz` (já cortado e com colormap resolvido, não o NetCDF cru). Só o primeiro worker a chegar baixa e processa; os demais leem o cache. Isso é protegido por lock de arquivo com timeout de 300s (5 min). Se o lock estourar esse tempo, situação típica com `num_workers` alto disputando o mesmo fundo, o worker desiste de esperar e **renderiza aquele frame sem fundo**, com aviso no console; não é fatal e não trava os outros frames. Em imagem única (`I`) esse cache/lock nem existe: o fundo é baixado e processado direto, sem ninguém pra disputar.
 
-- Python 3.10+
-- FFmpeg instalado e no `PATH` do sistema (obrigatório se `generation_type = V`)
+**Histórico do GLM nunca falha por causa de lock.** Cada arquivo de histórico de raios é baixado pra um temporário atômico por processo (sufixo `.part_<pid>`) e só depois vira o arquivo de cache via `os.replace()`. Se o lock desse arquivo específico não vier a tempo, o worker não desiste: baixa mesmo assim (com aviso) pro seu próprio temporário e faz o replace no final. No pior caso o download fica duplicado; nunca dá corrupção ou raio faltando no histórico.
 
-## Instalação
+**Arquivo ausente na NOAA: fatal em imagem única, aviso em vídeo, mas não por um `if` explícito pra isso.** É consequência de `image_date`/`image_time` gerarem só 1 timestamp-alvo: se ele não for encontrado no S3, a lista de tarefas fica vazia e a execução aborta porque não sobrou nada pra renderizar. No vídeo há vários timestamps-alvo; o que faltar é só logado como aviso e não entra na lista de tarefas, e o resto segue normal, com o vídeo final saindo sem aquele frame.
 
-```bash
-git clone https://github.com/ArthurPH25/goes-image-generator
-cd goes-image-generator
-```
+**Uma instância por pasta.** `satelite_temp_downloads/` e o cache de NetCDF do GLM são compartilhados entre todos os workers da execução e são **apagados por inteiro ao final**, com sucesso ou não. Por isso a execução trava com erro fatal se já existir `instance.lock` ativo na pasta: duas instâncias juntas destruiriam os temporários uma da outra no meio do processamento. O lock expira sozinho depois de 24h (proteção contra lock órfão de uma execução anterior que travou sem limpar).
 
-### Dependências de sistema (Cartopy)
+**PNG corrompido é validado duas vezes, nunca chega no FFmpeg.** Todo PNG já existente na pasta de assinatura (modo vídeo) é validado com `PIL.Image.verify()` antes de ser considerado "pronto". Isso cobre o caso de Ctrl+C ou queda de energia no meio da gravação de um frame, que deixa um PNG truncado em disco; se inválido, é apagado e re-renderizado. A mesma validação roda de novo na montagem final: frames corrompidos remanescentes são descartados nessa etapa, em Python, e o FFmpeg nunca chega a ver esses arquivos. Frames com dimensão diferente da do primeiro do lote são redimensionados (LANCZOS) antes de entrar no vídeo.
 
-`cartopy` depende de **GEOS** e **PROJ**, que não vêm pelo pip. Sem elas instaladas antes, `pip install cartopy` falha ao compilar.
+## Instalação e pré-requisitos
 
-**Ubuntu/Debian:**
-```bash
-sudo apt update
-sudo apt install libgeos-dev libproj-dev proj-bin proj-data
-```
+- **Cartopy exige GEOS/PROJ no sistema.** O caminho de menor atrito é Conda (`conda install -c conda-forge cartopy`): o conda-forge empacota os binários prontos, então o comando é o mesmo nos três SOs. Via `pip` puro cada SO vira uma dor de cabeça diferente pra resolver essas libs nativas.
+- **FFmpeg não precisa estar no PATH.** `imageio-ffmpeg` (já no `requirements.txt`) baixa e gerencia seu próprio binário automaticamente; não tem instalação de FFmpeg separada pra fazer.
+- **Headless já vem pronto.** `matplotlib.use("Agg")` é forçado no topo de `utils.py`, `goes_bands.py` e `GLM.py`, então rodar em servidor/SSH sem display não exige nenhuma variável de ambiente extra.
 
-**Fedora:**
-```bash
-sudo dnf install geos-devel proj-devel proj-data
-```
+## Estrutura de pastas de saída
 
-**macOS (Homebrew):**
-```bash
-brew install geos proj
-```
-
-**Windows:** use [Anaconda/Miniconda](https://docs.conda.io/en/latest/miniconda.html) e instale o cartopy via conda-forge — ele resolve os binários sozinho:
-```bash
-conda install -c conda-forge cartopy
-```
-Isso não substitui o FFmpeg — ele continua precisando ser instalado à parte e adicionado ao `PATH` (veja abaixo).
-
-### Dependências Python
-
-```bash
-pip install -r requirements.txt
-```
-
-### FFmpeg (obrigatório para `generation_type = V`)
-
-```bash
-# Ubuntu/Debian
-sudo apt install ffmpeg
-
-# macOS
-brew install ffmpeg
-
-# Windows: baixe em https://ffmpeg.org/download.html e adicione a pasta bin/ ao PATH
-```
-
-Confirme com `ffmpeg -version`.
-
-### Execução headless (servidor, container, SSH sem X11)
-
-Roda sem problemas em servidor sem interface gráfica — `matplotlib` já usa o backend `Agg` em todos os módulos. A única etapa que depende de ambiente gráfico é a abertura automática do vídeo ao final do modo `V` (`xdg-open`/`open`/`os.startfile`); em ambiente headless isso só falha silenciosamente com um aviso no console — o `.mp4` já está salvo em `satelite_videos/`.
-
----
-
-## Uso
-
-1. Edite `config.ini` e `colors.ini` na raiz do projeto (canal, data/hora, recorte, cores — ver [Configuração](#configuração)).
-2. Rode:
-```bash
-python index.py
-```
-3. Acompanhe pelo console: busca no S3, download, processamento dos frames e (se `V`) montagem do vídeo.
-
-### Saída
-
-| Pasta | Conteúdo |
-|---|---|
-| `satelite_images/` | PNGs do modo `generation_type = I` |
-| `satelite_videos/` | Vídeos `.mp4` do modo `generation_type = V` |
-| `satelite_temp_images/<assinatura>/` | Frames PNG intermediários do modo vídeo, isolados por combinação de parâmetros visuais; mantido se `delete_temp_images = False` |
-| `satelite_temp_downloads/` | Cache temporário de `.nc` baixados (NOAA + fundo ABI/GLM), limpo ao final da execução |
-
-Ao final, o console mostra o tempo de execução por etapa e um resumo de todos os avisos/erros não fatais da execução, incluindo os que rodaram nos workers.
-
----
+| Pasta | Conteúdo | Sobrevive entre execuções? |
+|---|---|---|
+| `satelite_images/` | PNGs do modo imagem única (`I`) | Sim (nome incrementa automaticamente pra não sobrescrever) |
+| `satelite_videos/` | MP4s finais do modo vídeo (`V`) | Sim (mesmo esquema de incremento) |
+| `satelite_temp_images/<assinatura>/` | Frames PNG do modo vídeo, uma pasta por `render_signature` | Só se `delete_temp_images = False` |
+| `satelite_temp_downloads/` | NetCDF baixados na execução atual + cache `.npz` do fundo ABI do GLM | Não, é apagado por inteiro ao final, independente de `delete_temp_images` |
+| `satelite_temp_downloads/glm_nc_cache/` | NetCDF brutos do GLM (arquivo principal + histórico), reaproveitados entre frames da mesma execução | Não, mesmo apagamento incondicional |
+| `satelite_temp_downloads/instance.lock` | Trava de execução única por pasta | Não (removido ao final; expira sozinho em 24h se sobrar de uma queda) |
 
 ## Licença
 
-[MIT License](LICENSE) — use, copie, modifique, distribua ou venda à vontade, com ou sem crédito, desde que o aviso de copyright original seja mantido. Fornecido "como está", sem garantias.
+Este projeto está sob a licença [MIT](LICENSE).

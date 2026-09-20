@@ -5,7 +5,7 @@ import os
 import random
 
 import s3fs
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import ClientError
 from netCDF4 import Dataset
 
 from utils import log_warning
@@ -18,6 +18,28 @@ MAX_RETRIES = 5
 BASE_BACKOFF_S = 1.5
 MAX_BACKOFF_S = 30.0
 
+ABI_PRODUCT = "ABI-L2-CMIPF"
+GLM_PRODUCT = "GLM-L2-LCFA"
+
+def build_hour_path(sat_bucket, dt, is_glm):
+    product = GLM_PRODUCT if is_glm else ABI_PRODUCT
+    return f"{sat_bucket}/{product}/{dt.year}/{dt.timetuple().tm_yday:03d}/{dt.hour:02d}/"
+
+def build_file_prefix(dt, is_glm):
+    prefix = f"s{dt.year:04d}{dt.timetuple().tm_yday:03d}{dt.hour:02d}{dt.minute:02d}"
+    return f"{prefix}{dt.second:02d}" if is_glm else prefix
+
+def create_async_s3_fs():
+    return s3fs.S3FileSystem(
+        anon=True,
+        asynchronous=True,
+        config_kwargs={
+            "connect_timeout": CONNECT_TIMEOUT_S,
+            "read_timeout": READ_TIMEOUT_S,
+            "retries": {"max_attempts": 0},
+        },
+    )
+
 def _is_not_found_error(exc: Exception) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
@@ -28,24 +50,8 @@ def _is_not_found_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "404" in msg or "no such key" in msg or "not found" in msg
 
-def _is_transient_network_error(exc: Exception) -> bool:
-    if isinstance(exc, (PermissionError, IsADirectoryError)):
-        return False
-    transient_types = (
-        asyncio.TimeoutError,
-        TimeoutError,
-        ConnectionError,
-        ConnectionResetError,
-        EndpointConnectionError,
-        OSError,
-    )
-    if isinstance(exc, transient_types):
-        return True
-    if isinstance(exc, ClientError):
-        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-        error_code = exc.response.get("Error", {}).get("Code", "")
-        return status in (500, 502, 503, 504) or error_code in ("SlowDown", "RequestTimeout", "InternalError")
-    return False
+def _is_permanent_local_error(exc: Exception) -> bool:
+    return isinstance(exc, (PermissionError, IsADirectoryError))
 
 def validate_nc_file(local_path: str, required_variables: list[str] | None = None) -> tuple[bool, str]:
     if not os.path.exists(local_path):
@@ -59,7 +65,6 @@ def validate_nc_file(local_path: str, required_variables: list[str] | None = Non
                 missing = [v for v in required_variables if v not in ds.variables]
                 if missing:
                     return False, f"variáveis ausentes no NetCDF: {missing}"
-            if required_variables:
                 for var_name in required_variables:
                     _ = ds.variables[var_name][:1]
         return True, "ok"
@@ -91,10 +96,9 @@ async def _download_one(
                     os.remove(local_path)
                 if _is_not_found_error(e):
                     return remote_path, False, f"arquivo não encontrado no bucket (404): {e}"
-                if _is_transient_network_error(e):
-                    last_error_msg = f"erro transitório de rede/timeout: {e}"
-                else:
-                    last_error_msg = f"erro inesperado: {e}"
+                if _is_permanent_local_error(e):
+                    return remote_path, False, f"erro local de permissão/caminho, sem nova tentativa: {e}"
+                last_error_msg = f"{type(e).__name__}: {e}"
             if attempt < max_retries:
                 backoff = min(BASE_BACKOFF_S * (2 ** (attempt - 1)), MAX_BACKOFF_S)
                 jitter = random.uniform(0, backoff * 0.5)
@@ -110,15 +114,7 @@ async def download_batch_async(
 ) -> dict[str, tuple[bool, str]]:
     if not downloads:
         return {}
-    fs = s3fs.S3FileSystem(
-        anon=True,
-        asynchronous=True,
-        config_kwargs={
-            "connect_timeout": CONNECT_TIMEOUT_S,
-            "read_timeout": READ_TIMEOUT_S,
-            "retries": {"max_attempts": 0},
-        },
-    )
+    fs = create_async_s3_fs()
     session = await fs.set_session()
     try:
         semaphore = asyncio.Semaphore(max_concurrent)

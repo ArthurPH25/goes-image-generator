@@ -1,3 +1,4 @@
+import copy
 from datetime import datetime
 
 import matplotlib
@@ -10,7 +11,6 @@ import numpy as np
 from utils import (
     read_map_geometry_config,
     read_style_config,
-    get_projection_params,
     create_map_axes,
     add_geo_features,
     add_watermark,
@@ -18,6 +18,16 @@ from utils import (
     save_figure,
     TITLE_FONTSIZE_PT,
 )
+
+ABI_REQUIRED_VARS = ["CMI"]
+
+def get_projection_params(nc, variable_name="goes_imager_projection"):
+    projection_var = nc.variables[variable_name]
+    height = projection_var.perspective_point_height
+    lon = projection_var.longitude_of_projection_origin
+    req = getattr(projection_var, "semi_major_axis", None)
+    rpol = getattr(projection_var, "semi_minor_axis", None)
+    return height, lon, req, rpol
 
 COLORBAR_FRACTION = 0.03
 COLORBAR_PAD = 0.04
@@ -47,16 +57,22 @@ def _lonlat_to_scan_angle(lon, lat, sat_lon, sat_height_total, req, rpol):
     x = np.arcsin(-sy / np.sqrt(sx ** 2 + sy ** 2 + sz ** 2))
     return x, y
 
-def get_crop_slices(nc, target_coords, margin_frac=0.05, min_margin_px=6):
+def get_crop_slices(nc, target_coords, margin_frac=0.05, min_margin_px=6, edge_samples=25):
     lon_w, lon_e, lat_s, lat_n = target_coords
     proj = nc.variables["goes_imager_projection"]
     sat_lon = proj.longitude_of_projection_origin
     req = proj.semi_major_axis
     rpol = proj.semi_minor_axis
     sat_height_total = proj.perspective_point_height + req
-    corner_lons = np.array([lon_w, lon_w, lon_e, lon_e])
-    corner_lats = np.array([lat_s, lat_n, lat_s, lat_n])
-    xs, ys = _lonlat_to_scan_angle(corner_lons, corner_lats, sat_lon, sat_height_total, req, rpol)
+    edge_lons = np.linspace(lon_w, lon_e, edge_samples)
+    edge_lats = np.linspace(lat_s, lat_n, edge_samples)
+    boundary_lons = np.concatenate([
+        edge_lons, edge_lons, np.full(edge_samples, lon_w), np.full(edge_samples, lon_e),
+    ])
+    boundary_lats = np.concatenate([
+        np.full(edge_samples, lat_n), np.full(edge_samples, lat_s), edge_lats, edge_lats,
+    ])
+    xs, ys = _lonlat_to_scan_angle(boundary_lons, boundary_lats, sat_lon, sat_height_total, req, rpol)
     valid = np.isfinite(xs) & np.isfinite(ys)
     if not valid.any():
         return slice(None), slice(None)
@@ -65,12 +81,12 @@ def get_crop_slices(nc, target_coords, margin_frac=0.05, min_margin_px=6):
     y_rad = nc.variables["y"][:]
     col_start_raw = int(np.searchsorted(x_rad, xs.min(), side="left"))
     col_end_raw = int(np.searchsorted(x_rad, xs.max(), side="right"))
-    y_desc = y_rad[::-1]
-    row_start_desc = int(np.searchsorted(y_desc, ys.min(), side="left"))
-    row_end_desc = int(np.searchsorted(y_desc, ys.max(), side="right"))
+    y_asc = y_rad[::-1]
+    row_start_asc = int(np.searchsorted(y_asc, ys.min(), side="left"))
+    row_end_asc = int(np.searchsorted(y_asc, ys.max(), side="right"))
     n_y = len(y_rad)
-    row_start_raw = n_y - row_end_desc
-    row_end_raw = n_y - row_start_desc
+    row_start_raw = n_y - row_end_asc
+    row_end_raw = n_y - row_start_asc
     margin_cols = max(min_margin_px, int((col_end_raw - col_start_raw) * margin_frac))
     margin_rows = max(min_margin_px, int((row_end_raw - row_start_raw) * margin_frac))
     col_start = max(col_start_raw - margin_cols, 0)
@@ -118,13 +134,21 @@ def compute_image_extent(x_rad, y_rad, sat_height):
 def is_valid_band(band_id):
     return band_id in REFLECTANCE_BANDS or band_id in THERMAL_BANDS
 
-def _build_thermal_colormap(config, band_id):
+NO_DATA_COLOR = "black"
+
+def reflectance_cmap():
+    cmap = copy.copy(plt.get_cmap("gray"))
+    cmap.set_bad(NO_DATA_COLOR)
+    return cmap
+
+def build_thermal_colormap(config, band_id):
     section = f"PALETTE_BAND_{band_id:02d}"
     colors_dict = {int(key): value for key, value in config.items(section)}
     min_v = min(colors_dict.keys())
     max_v = max(colors_dict.keys())
     norm_list = sorted(((value - min_v) / (max_v - min_v), color) for value, color in colors_dict.items())
     cmap = mcolors.LinearSegmentedColormap.from_list(f"THERMAL_{band_id:02d}", norm_list)
+    cmap.set_bad(NO_DATA_COLOR)
     return cmap, min_v, max_v
 
 def extract_band_data(local_path, config, band_id, map_geo):
@@ -134,14 +158,16 @@ def extract_band_data(local_path, config, band_id, map_geo):
         sat_h, sat_lon, sat_req, sat_rpol = get_projection_params(nc)
         row_slice, col_slice = get_crop_slices(nc, map_geo["target_coordinates"])
 
+        raw = nc.variables["CMI"][row_slice, col_slice]
         if is_reflectance:
             band_title, wavelength = REFLECTANCE_BANDS[band_id]
-            data = np.clip(nc.variables["CMI"][row_slice, col_slice], 0, 1) ** (1 / 2.2)
-            cmap, vmin, vmax, tick_step = "gray", 0, 1, None
+            data = np.clip(raw, 0, 1) ** (1 / 2.2)
+            cmap, vmin, vmax, tick_step = reflectance_cmap(), 0, 1, None
         else:
             band_title, wavelength, tick_step = THERMAL_BANDS[band_id]
-            data = (nc.variables["CMI"][row_slice, col_slice] - 273.15).astype("float32")
-            cmap, vmin, vmax = _build_thermal_colormap(config, band_id)
+            data = raw - 273.15
+            cmap, vmin, vmax = build_thermal_colormap(config, band_id)
+        data = np.ma.filled(data.astype("float32"), np.nan)
 
         x_rad = nc.variables["x"][col_slice]
         y_rad = nc.variables["y"][row_slice]
@@ -151,7 +177,7 @@ def extract_band_data(local_path, config, band_id, map_geo):
 
     return {
         "is_reflectance": is_reflectance,
-        "data": np.asarray(data),
+        "data": data,
         "img_extent": img_extent,
         "cmap": cmap,
         "vmin": vmin,
@@ -164,12 +190,6 @@ def extract_band_data(local_path, config, band_id, map_geo):
         "sat_req": sat_req,
         "sat_rpol": sat_rpol,
     }
-
-def rebuild_cmap_for_band(config, band_id, is_reflectance):
-    if is_reflectance:
-        return "gray"
-    cmap, _, _ = _build_thermal_colormap(config, band_id)
-    return cmap
 
 def draw_band_on_axes(ax, geo_proj, band_data, style):
     add_geo_features(ax, style)
@@ -188,11 +208,10 @@ def _render_common(local_path, config, band_id, map_geo, style):
     ) if needs_colorbar else 0.0
 
     figsize = (style["figure_width"], style["figure_height"])
-    fig, ax, geo_proj, title_ax, _ = create_map_axes(
+    fig, ax, geo_proj, title_ax = create_map_axes(
         map_geo["projection"], band_data["sat_lon"], band_data["sat_h"],
         style["clean_mode"], map_geo["target_coordinates"], figsize=figsize,
         semi_major_axis=band_data["sat_req"], semi_minor_axis=band_data["sat_rpol"],
-        title_fontsize_pt=None if style["clean_mode"] else TITLE_FONTSIZE_PT,
         reserve_right_frac=reserve_right_frac,
     )
 

@@ -15,14 +15,14 @@ from matplotlib.font_manager import FontProperties
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-GOES_TRANSITION_DATE = datetime(2025, 4, 7, tzinfo=timezone.utc)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+GOES_TRANSITION_UTC = datetime(2025, 4, 7, 15, 10, tzinfo=timezone.utc)
 
 LOCK_POLL_INTERVAL_S = 0.5
 LOCK_STALE_TIMEOUT_S = 300
 
-TEMP_NC_DIR = "satelite_temp_downloads"
-GLM_NC_CACHE_DIR = os.path.join(TEMP_NC_DIR, "glm_nc_cache")
-ABI_REQUIRED_VARS = ["CMI"]
+TEMP_NC_DIR = os.path.join(BASE_DIR, "satelite_temp_downloads")
 
 LOG_COLLECTOR_STATE = {"collector": None}
 
@@ -46,11 +46,12 @@ def log_info(message):
     print(f"ℹ️ {message}")
 
 def get_satellite_info(target_dt):
-    if target_dt < GOES_TRANSITION_DATE:
+    if target_dt < GOES_TRANSITION_UTC:
         return "noaa-goes16", "GOES-16"
     return "noaa-goes19", "GOES-19"
 
 ABI_STEP_MINUTES = 10
+GLM_STEP_SECONDS = 20
 
 def floor_to_abi_step(dt):
     floored_minute = (dt.minute // ABI_STEP_MINUTES) * ABI_STEP_MINUTES
@@ -67,6 +68,21 @@ def read_map_geometry_config(config):
             f"(oeste, leste, sul, norte), recebido: '{config.get('MAP', 'target_coordinates')}'"
         )
     target_coordinates = [float(value.strip()) for value in coords_raw]
+    lon_w, lon_e, lat_s, lat_n = target_coordinates
+    if not (-180.0 <= lon_w <= 180.0) or not (-180.0 <= lon_e <= 180.0):
+        raise ValueError(
+            "target_coordinates: oeste e leste devem estar entre -180 e 180, "
+            f"recebido: oeste={lon_w}, leste={lon_e}"
+        )
+    if not (-90.0 <= lat_s <= 90.0) or not (-90.0 <= lat_n <= 90.0):
+        raise ValueError(
+            "target_coordinates: sul e norte devem estar entre -90 e 90, "
+            f"recebido: sul={lat_s}, norte={lat_n}"
+        )
+    if lon_w >= lon_e:
+        raise ValueError(f"target_coordinates: oeste ({lon_w}) deve ser menor que leste ({lon_e})")
+    if lat_s >= lat_n:
+        raise ValueError(f"target_coordinates: sul ({lat_s}) deve ser menor que norte ({lat_n})")
 
     flash_marker_min = config.getfloat("MAP", "glm_flash_marker_min")
     flash_marker_max = config.getfloat("MAP", "glm_flash_marker_max")
@@ -88,7 +104,7 @@ def read_map_geometry_config(config):
         "glm_flash_marker_max": flash_marker_max,
     }
 
-def _validate_color(key, raw_value):
+def validate_color(key, raw_value):
     value = raw_value.strip()
     if not mcolors.is_color_like(value):
         raise ValueError(
@@ -102,13 +118,28 @@ def read_style_config(config):
     if watermark_size <= 0:
         raise ValueError(f"watermark_size deve ser um número positivo, recebido: {watermark_size}")
 
-    borders_color = _validate_color("borders_color", config.get("STYLE", "borders_color"))
-    states_color = _validate_color("states_color", config.get("STYLE", "states_color"))
-    coast_color = _validate_color("coast_color", config.get("STYLE", "coast_color"))
+    figure_width = config.getfloat("STYLE", "figure_width")
+    figure_height = config.getfloat("STYLE", "figure_height")
+    if figure_width <= 0 or figure_height <= 0:
+        raise ValueError(
+            "figure_width e figure_height devem ser positivos, "
+            f"recebido: width={figure_width}, height={figure_height}"
+        )
 
-    watermark_color = config.get("STYLE", "watermark_color").strip()
-    if watermark_color:
-        _validate_color("watermark_color", watermark_color)
+    borders_line_width = config.getfloat("STYLE", "borders_line_width")
+    states_line_width = config.getfloat("STYLE", "states_line_width")
+    coast_line_width = config.getfloat("STYLE", "coast_line_width")
+    if borders_line_width < 0 or states_line_width < 0 or coast_line_width < 0:
+        raise ValueError(
+            "borders_line_width, states_line_width e coast_line_width não podem ser negativos, "
+            f"recebido: borders={borders_line_width}, states={states_line_width}, coast={coast_line_width}"
+        )
+
+    borders_color = validate_color("borders_color", config.get("STYLE", "borders_color"))
+    states_color = validate_color("states_color", config.get("STYLE", "states_color"))
+    coast_color = validate_color("coast_color", config.get("STYLE", "coast_color"))
+
+    watermark_color = validate_color("watermark_color", config.get("STYLE", "watermark_color"))
 
     return {
         "watermark": config.get("STYLE", "watermark"),
@@ -116,22 +147,14 @@ def read_style_config(config):
         "watermark_size": watermark_size,
         "clean_mode": config.getboolean("STYLE", "clean_mode"),
         "borders_color": borders_color,
-        "borders_line_width": config.getfloat("STYLE", "borders_line_width"),
+        "borders_line_width": borders_line_width,
         "states_color": states_color,
-        "states_line_width": config.getfloat("STYLE", "states_line_width"),
+        "states_line_width": states_line_width,
         "coast_color": coast_color,
-        "coast_line_width": config.getfloat("STYLE", "coast_line_width"),
-        "figure_width": config.getfloat("STYLE", "figure_width"),
-        "figure_height": config.getfloat("STYLE", "figure_height"),
+        "coast_line_width": coast_line_width,
+        "figure_width": figure_width,
+        "figure_height": figure_height,
     }
-
-def get_projection_params(nc, variable_name="goes_imager_projection"):
-    projection_var = nc.variables[variable_name]
-    height = projection_var.perspective_point_height
-    lon = projection_var.longitude_of_projection_origin
-    req = getattr(projection_var, "semi_major_axis", None)
-    rpol = getattr(projection_var, "semi_minor_axis", None)
-    return height, lon, req, rpol
 
 TITLE_FONTSIZE_PT = 16
 
@@ -175,7 +198,7 @@ def compute_fitted_map_figsize(projection_type, sat_lon, sat_height, target_coor
 
 def create_map_axes(projection_type, sat_lon, sat_height, clean_mode, target_coordinates,
                      figsize=(16, 14), semi_major_axis=None, semi_minor_axis=None,
-                     title_fontsize_pt=None, reserve_right_frac=0.0):
+                     title_fontsize_pt=TITLE_FONTSIZE_PT, reserve_right_frac=0.0):
     full_width_in, base_height_in = figsize
     map_width_in = full_width_in * (1.0 - reserve_right_frac) if reserve_right_frac else full_width_in
 
@@ -194,13 +217,7 @@ def create_map_axes(projection_type, sat_lon, sat_height, clean_mode, target_coo
         ax = fig.add_axes([0, 0, map_width_frac, 1], projection=map_proj)
         ax.axis("off")
         ax.set_extent(target_coordinates, crs=ccrs.PlateCarree())
-        return fig, ax, geo_proj, None, map_width_frac
-
-    if title_fontsize_pt is None:
-        fig = plt.figure(figsize=(total_w, fitted_h), facecolor="black")
-        ax = fig.add_axes([0, 0, map_width_frac, 1], projection=map_proj)
-        ax.set_extent(target_coordinates, crs=ccrs.PlateCarree())
-        return fig, ax, geo_proj, None, map_width_frac
+        return fig, ax, geo_proj, None
 
     title_frac = compute_title_band_fraction(fitted_h, title_fontsize_pt)
     total_h = fitted_h / (1.0 - title_frac)
@@ -215,7 +232,7 @@ def create_map_axes(projection_type, sat_lon, sat_height, clean_mode, target_coo
     ax = fig.add_axes([0, 0, map_width_frac, map_frac_h], projection=map_proj)
     ax.set_extent(target_coordinates, crs=ccrs.PlateCarree())
 
-    return fig, ax, geo_proj, title_ax, map_width_frac
+    return fig, ax, geo_proj, title_ax
 
 def add_geo_features(ax, style):
     ax.add_feature(cfeature.STATES.with_scale("10m"), linewidth=style["states_line_width"],
@@ -276,13 +293,7 @@ def save_figure(fig, png_path, dpi):
     fig.clf()
     plt.close(fig)
 
-def glm_nc_cache_paths(cache_dir, remote_path):
-    base_name = os.path.basename(remote_path).replace(".nc", "")
-    cache_data = os.path.join(cache_dir, f"glm_{base_name}.nc")
-    lock_path = os.path.join(cache_dir, f"glm_{base_name}.lock")
-    return cache_data, lock_path
-
-def acquire_background_lock(lock_path):
+def acquire_file_lock(lock_path):
     start = time.time()
     while True:
         try:
@@ -297,7 +308,7 @@ def acquire_background_lock(lock_path):
                 if timestamp_str:
                     lock_time = float(timestamp_str)
                     if time.time() - lock_time > LOCK_STALE_TIMEOUT_S:
-                        log_warning("Removendo lock obsoleto do fundo.")
+                        log_warning("Removendo lock obsoleto.")
                         os.remove(lock_path)
                         continue
             except Exception:
@@ -306,7 +317,7 @@ def acquire_background_lock(lock_path):
                 return False
             time.sleep(LOCK_POLL_INTERVAL_S)
 
-def release_background_lock(lock_path):
+def release_file_lock(lock_path):
     try:
         if os.path.exists(lock_path):
             os.remove(lock_path)

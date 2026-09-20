@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,8 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+import cartopy.feature as cfeature
+import cartopy.io.shapereader as shpreader
 from PIL import Image
 import imageio.v2 as imageio
 import numpy as np
@@ -32,22 +35,22 @@ from utils import (
     log_error,
     log_warning,
     log_info,
-    glm_nc_cache_paths,
-    acquire_background_lock,
-    release_background_lock,
+    acquire_file_lock,
+    release_file_lock,
+    validate_color,
     LOG_COLLECTOR_STATE,
     floor_to_abi_step,
     read_map_geometry_config,
     read_style_config,
+    BASE_DIR,
     TEMP_NC_DIR,
-    GLM_NC_CACHE_DIR,
-    ABI_REQUIRED_VARS,
+    ABI_STEP_MINUTES,
+    GLM_STEP_SECONDS,
 )
-from S3_downloader import download_batch
+from S3_downloader import download_batch, build_hour_path, build_file_prefix, GLM_PRODUCT
 
 warnings.filterwarnings("ignore")
 
-GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
 INSTANCE_LOCK_STALE_TIMEOUT_S = 24 * 60 * 60
 
 def configure_log_collector(shared_list):
@@ -117,12 +120,79 @@ def acquire_instance_lock(lock_path):
             pass
         return False
 
-def release_instance_lock(lock_path):
-    try:
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except OSError:
-        pass
+def _purge_temp_files(dir_path, skip_names=frozenset(), label=""):
+    if not os.path.isdir(dir_path):
+        return
+    removed = 0
+    for name in os.listdir(dir_path):
+        full_path = os.path.join(dir_path, name)
+        if name in skip_names or os.path.isdir(full_path):
+            continue
+        try:
+            os.remove(full_path)
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        log_info(f"Limpando {removed} arquivo(s) {label} em '{dir_path}'...")
+
+def _get_positive_int(config, section, key):
+    value = config.getint(section, key)
+    if value < 1:
+        raise ValueError(
+            f"{key} em [{section}] deve ser um número inteiro maior ou igual a 1, recebido: {value}"
+        )
+    return value
+
+def prefetch_map_features(resolution="10m"):
+    for feature in (cfeature.STATES, cfeature.BORDERS, cfeature.COASTLINE):
+        try:
+            shpreader.natural_earth(resolution=resolution, category=feature.category, name=feature.name)
+        except Exception as e:
+            log_warning(
+                f"Não foi possível preparar o dado de mapa '{feature.name}' ({resolution}): {e}. "
+                "Na primeira execução é preciso ter internet para o Cartopy baixá-lo."
+            )
+
+def validate_palette_section(config, section, min_keys=2):
+    if not config.has_section(section):
+        raise ValueError(f"seção '[{section}]' ausente em colors.ini")
+    items = config.items(section)
+    if len(items) < min_keys:
+        raise ValueError(
+            f"seção '[{section}]' precisa de pelo menos {min_keys} chaves de temperatura "
+            f"diferentes para interpolar cores, encontrada(s) {len(items)}"
+        )
+    for key, value in items:
+        try:
+            int(key)
+        except ValueError:
+            raise ValueError(
+                f"chave '{key}' na seção '[{section}]' não é um número inteiro válido "
+                "(valores físicos devem ser inteiros, ex: -63, não -63.5 nem 'default')"
+            )
+        validate_color(f"[{section}] chave {key}", value)
+
+def validate_glm_palette_section(config, require_age_keys):
+    section = "PALETTE_GLM"
+    if not config.has_section(section):
+        raise ValueError(f"seção '[{section}]' ausente em colors.ini, obrigatória para o canal GLM")
+    if not config.has_option(section, "default"):
+        raise ValueError(f"chave 'default' ausente na seção '[{section}]'")
+    validate_color(f"[{section}] chave default", config.get(section, "default"))
+    for key, _ in config.items(section):
+        if key != "default" and not (key.isascii() and key.isdigit()):
+            raise ValueError(
+                f"chave '{key}' na seção '[{section}]' inválida: use 'default' ou uma idade inteira "
+                "em segundos (ex: 150)"
+            )
+    numeric_items = [(k, v) for k, v in config.items(section) if k.isdigit()]
+    if require_age_keys and not numeric_items:
+        raise ValueError(
+            f"glm_flash_age = True exige ao menos uma chave numérica de idade em [{section}]"
+        )
+    for key, value in numeric_items:
+        validate_color(f"[{section}] chave {key}", value)
 
 def compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi):
     map_geo = read_map_geometry_config(config)
@@ -144,9 +214,17 @@ def compute_render_signature(config, channel_id, is_glm, glm_background_band, dp
         if config.has_section(section):
             palette_data[section] = sorted(config.items(section))
 
+    glm_flash_age = config.getboolean("MAP", "glm_flash_age") if is_glm else None
+    glm_history_lookback_steps = (
+        config.getint("PROCESSING", "glm_history_lookback_steps")
+        if (is_glm and glm_flash_age) else None
+    )
+
     signature_payload = {
         "channel": "GLM" if is_glm else channel_id,
         "glm_background_band": glm_background_band if is_glm else None,
+        "glm_flash_age": glm_flash_age,
+        "glm_history_lookback_steps": glm_history_lookback_steps,
         "dpi": dpi,
         "map_geo": map_geo,
         "style": style,
@@ -156,17 +234,24 @@ def compute_render_signature(config, channel_id, is_glm, glm_background_band, dp
     digest = hashlib.sha1(payload_json.encode("utf-8")).hexdigest()[:12]
     return digest
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.ini")
-COLORS_PATH = os.path.join(SCRIPT_DIR, "colors.ini")
+CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+COLORS_PATH = os.path.join(BASE_DIR, "colors.ini")
 
-IMAGES_DIR = "satelite_images"
-VIDEOS_DIR = "satelite_videos"
-TEMP_IMAGES_DIR = "satelite_temp_images"
+IMAGES_DIR = os.path.join(BASE_DIR, "satelite_images")
+VIDEOS_DIR = os.path.join(BASE_DIR, "satelite_videos")
+TEMP_IMAGES_DIR = os.path.join(BASE_DIR, "satelite_temp_images")
 INSTANCE_LOCK_PATH = os.path.join(TEMP_NC_DIR, "instance.lock")
 
-config = configparser.ConfigParser()
-if len(config.read([COLORS_PATH, CONFIG_PATH])) < 2:
+config = configparser.ConfigParser(interpolation=None)
+try:
+    _files_read = config.read([COLORS_PATH, CONFIG_PATH], encoding="utf-8")
+except (configparser.Error, UnicodeDecodeError) as e:
+    exit_fatal(
+        f"Não foi possível ler 'colors.ini'/'config.ini': {e}\n"
+        "Confira: cada chave aparece só uma vez por seção, toda seção tem cabeçalho [NOME], "
+        "comentários ficam em linhas próprias (começando com #) e os arquivos estão salvos em UTF-8."
+    )
+if len(_files_read) < 2:
     exit_fatal("Arquivo 'colors.ini' e/ou 'config.ini' não encontrado no diretório do script.")
 
 try:
@@ -181,17 +266,63 @@ try:
     if gen_type not in ["I", "V"]:
         exit_fatal(f"generation_type '{gen_type}' inválido. Os valores válidos são 'I' ou 'V'.")
 
-    num_workers = config.getint("PROCESSING", "num_workers")
+    num_workers = _get_positive_int(config, "PROCESSING", "num_workers")
     delete_temp = config.getboolean("PROCESSING", "delete_temp_images")
-    max_concurrent_downloads = config.getint("PROCESSING", "max_concurrent_downloads")
-    dpi = config.getint("PROCESSING", "dpi")
+    open_video = config.getboolean("PROCESSING", "open_video_when_done")
+    dpi = _get_positive_int(config, "PROCESSING", "dpi")
+
+    if is_glm:
+        _get_positive_int(config, "PROCESSING", "glm_history_lookback_steps")
+        _get_positive_int(config, "PROCESSING", "glm_history_max_concurrent_downloads")
 
     video_scale = config.get("FFMPEG", "video_scale")
     crf_value = config.get("FFMPEG", "crf")
     ffmpeg_preset = config.get("FFMPEG", "preset")
 
+    if gen_type == "V":
+        VALID_FFMPEG_PRESETS = {
+            "ultrafast", "superfast", "veryfast", "faster", "fast",
+            "medium", "slow", "slower", "veryslow",
+        }
+        if ffmpeg_preset.strip().lower() not in VALID_FFMPEG_PRESETS:
+            raise ValueError(
+                f"preset '{ffmpeg_preset}' inválido. Valores aceitos pelo FFmpeg (libx264): "
+                f"{sorted(VALID_FFMPEG_PRESETS)}"
+            )
+        try:
+            crf_int = int(crf_value)
+        except ValueError:
+            raise ValueError(f"crf '{crf_value}' deve ser um número inteiro")
+        if not (0 <= crf_int <= 51):
+            raise ValueError(f"crf '{crf_value}' fora do intervalo válido do FFmpeg (0 a 51)")
+        if not re.match(r"^scale=-?\d+:-?\d+$", video_scale.strip()):
+            raise ValueError(
+                f"video_scale '{video_scale}' fora do formato esperado 'scale=LARGURA:ALTURA' "
+                "(use -2 na dimensão que deve manter a proporção, ex: scale=1920:-2)"
+            )
+
     glm_background_band = config.get("MAP", "glm_background_band").strip()
-    clean_mode_active = config.getboolean("STYLE", "clean_mode")
+    glm_flash_age = config.getboolean("MAP", "glm_flash_age")
+
+    if glm_background_band:
+        try:
+            bg_band_id = int(glm_background_band)
+        except ValueError:
+            raise ValueError(
+                "glm_background_band deve ser um número inteiro de canal (1 a 16) ou vazio, "
+                f"recebido: '{glm_background_band}'"
+            )
+        if not goes_bands.is_valid_band(bg_band_id):
+            raise ValueError(
+                f"glm_background_band '{bg_band_id}' inválido. Os canais válidos vão de 1 a 16."
+            )
+        if not (1 <= bg_band_id <= 6):
+            validate_palette_section(config, f"PALETTE_BAND_{bg_band_id:02d}")
+
+    if is_glm:
+        validate_glm_palette_section(config, require_age_keys=glm_flash_age)
+    elif not (1 <= channel_id <= 6):
+        validate_palette_section(config, f"PALETTE_BAND_{channel_id:02d}")
 
     render_signature = compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi)
     run_temp_dir = os.path.join(TEMP_IMAGES_DIR, render_signature)
@@ -205,50 +336,52 @@ try:
         target_dt = parse_datetime(date_str, time_str, require_seconds=is_glm)
 
         if is_glm:
-            if target_dt.second % 20 != 0:
+            if target_dt.second % GLM_STEP_SECONDS != 0:
                 raise ValueError("Canal GLM exige segundos múltiplos de 20 (00, 20 ou 40).")
         else:
-            if target_dt.minute % 10 != 0:
+            if target_dt.minute % ABI_STEP_MINUTES != 0:
                 raise ValueError("Canal ABI exige minutos múltiplos de 10 (imagem a cada 10 minutos).")
 
         target_dates.append(target_dt)
-        video_fps = 10
     else:
         start_date_str = config.get("VIDEO_TIME", "start_date")
         start_time_str = config.get("VIDEO_TIME", "start_time")
         end_date_str = config.get("VIDEO_TIME", "end_date")
         end_time_str = config.get("VIDEO_TIME", "end_time")
-        video_fps = config.getint("VIDEO_TIME", "fps")
+        video_fps = _get_positive_int(config, "VIDEO_TIME", "fps")
 
         start_dt = parse_datetime(start_date_str, start_time_str, require_seconds=is_glm)
         end_dt = parse_datetime(end_date_str, end_time_str, require_seconds=is_glm)
 
         if is_glm:
-            if start_dt.second % 20 != 0 or end_dt.second % 20 != 0:
+            if start_dt.second % GLM_STEP_SECONDS != 0 or end_dt.second % GLM_STEP_SECONDS != 0:
                 raise ValueError("Início e fim do vídeo GLM exigem segundos múltiplos de 20 (00, 20 ou 40).")
         else:
-            if start_dt.minute % 10 != 0 or end_dt.minute % 10 != 0:
+            if start_dt.minute % ABI_STEP_MINUTES != 0 or end_dt.minute % ABI_STEP_MINUTES != 0:
                 raise ValueError("Início e fim do vídeo ABI exigem minutos múltiplos de 10.")
 
         if end_dt <= start_dt:
-            start_dt, end_dt = end_dt, start_dt
+            raise ValueError(
+                "O período do vídeo é inválido: end_date/end_time "
+                f"({end_dt.strftime('%Y-%m-%d %H:%M:%S')}) deve ser posterior a "
+                f"start_date/start_time ({start_dt.strftime('%Y-%m-%d %H:%M:%S')})."
+            )
 
         current_dt = start_dt
-        step = timedelta(seconds=20) if is_glm else timedelta(minutes=10)
+        step = timedelta(seconds=GLM_STEP_SECONDS) if is_glm else timedelta(minutes=ABI_STEP_MINUTES)
         while current_dt <= end_dt:
             target_dates.append(current_dt)
             current_dt += step
 
 except Exception as e:
-    exit_fatal(f"Falha ao validar 'config.ini': {e}")
+    exit_fatal(
+        f"Falha ao validar 'config.ini'/'colors.ini': {e}\n"
+        "Dica: se o valor citado na mensagem tiver um '#' no meio, é um comentário na mesma linha "
+        "do valor. Mova o comentário para uma linha própria."
+    )
 
 def build_png_name(remote_file):
-    png_name = remote_file.split("/")[-1].replace(".nc", ".png")
-    if is_glm and glm_background_band:
-        png_name = png_name.replace(".png", f"_C{int(glm_background_band):02d}.png")
-    if gen_type == "I" and clean_mode_active:
-        png_name = png_name.replace(".png", "_clean.png")
-    return png_name
+    return remote_file.split("/")[-1].replace(".nc", ".png")
 
 def _is_valid_png(path):
     try:
@@ -258,15 +391,11 @@ def _is_valid_png(path):
     except Exception:
         return False
 
-def _init_worker_log_collector(shared_log_list):
-    configure_log_collector(shared_log_list)
-
 def process_file_worker(args):
     remote_file, remote_abi_file, output_path, sat_name, target_ts, current_gen_type = args
     target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
 
-    glm_cache_lock_path = None
-    got_glm_lock = False
+    local_nc_path = None
     try:
         file_name = remote_file.split("/")[-1]
         png_path = os.path.join(output_path, build_png_name(remote_file))
@@ -289,42 +418,60 @@ def process_file_worker(args):
             os.remove(png_path)
 
         if is_glm:
-            os.makedirs(GLM_NC_CACHE_DIR, exist_ok=True)
-            cache_path, glm_cache_lock_path = glm_nc_cache_paths(GLM_NC_CACHE_DIR, remote_file)
+            os.makedirs(GLM.GLM_NC_CACHE_DIR, exist_ok=True)
+            cache_path, glm_cache_lock_path = GLM.glm_nc_cache_paths(GLM.GLM_NC_CACHE_DIR, remote_file)
             local_nc_path = cache_path
             if os.path.exists(cache_path):
                 log_info(f"[{log_time} UTC] NetCDF principal já em cache (reaproveitado de outro frame).")
             else:
-                got_glm_lock = acquire_background_lock(glm_cache_lock_path)
+                got_glm_lock = acquire_file_lock(glm_cache_lock_path)
                 try:
                     if os.path.exists(cache_path):
                         log_info(f"[{log_time} UTC] NetCDF principal já em cache (reaproveitado de outro frame).")
                     else:
+                        if not got_glm_lock:
+                            log_warning(
+                                f"[{log_time} UTC] Timeout esperando lock do NetCDF principal do GLM; "
+                                "baixando mesmo assim (protegido por arquivo temporário atômico)."
+                            )
+                        tmp_download_path = f"{cache_path}.part_{os.getpid()}"
                         batch = [{
                             "remote_path": remote_file,
-                            "local_path": cache_path,
-                            "required_variables": GLM_REQUIRED_VARS,
+                            "local_path": tmp_download_path,
+                            "required_variables": GLM.GLM_REQUIRED_VARS,
                             "label": f"{log_time} principal",
                         }]
-                        log_info(f"[{log_time} UTC] Baixando {len(batch)} arquivo(s) concorrentemente.")
-                        results = download_batch(batch, max_concurrent=max_concurrent_downloads)
-                        main_ok, main_msg = results[remote_file]
-                        if not main_ok:
-                            raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
+                        log_info(f"[{log_time} UTC] Baixando o NetCDF principal.")
+                        try:
+                            results = download_batch(batch)
+                            main_ok, main_msg = results[remote_file]
+                            if not main_ok:
+                                raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
+                            if os.path.exists(cache_path):
+                                os.remove(tmp_download_path)
+                            else:
+                                os.replace(tmp_download_path, cache_path)
+                        except Exception:
+                            if os.path.exists(tmp_download_path):
+                                try:
+                                    os.remove(tmp_download_path)
+                                except OSError:
+                                    pass
+                            raise
                 finally:
                     if got_glm_lock:
-                        release_background_lock(glm_cache_lock_path)
+                        release_file_lock(glm_cache_lock_path)
                         got_glm_lock = False
         else:
             local_nc_path = os.path.join(TEMP_NC_DIR, f"temp_{file_name}")
             batch = [{
                 "remote_path": remote_file,
                 "local_path": local_nc_path,
-                "required_variables": ABI_REQUIRED_VARS,
+                "required_variables": goes_bands.ABI_REQUIRED_VARS,
                 "label": f"{log_time} principal",
             }]
-            log_info(f"[{log_time} UTC] Baixando {len(batch)} arquivo(s) concorrentemente.")
-            results = download_batch(batch, max_concurrent=max_concurrent_downloads)
+            log_info(f"[{log_time} UTC] Baixando o NetCDF principal.")
+            results = download_batch(batch)
             main_ok, main_msg = results[remote_file]
             if not main_ok:
                 raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
@@ -341,9 +488,6 @@ def process_file_worker(args):
         if not os.path.exists(png_path):
             raise Exception("O módulo do canal não gerou o PNG esperado (falha silenciosa).")
 
-        if not is_glm and os.path.exists(local_nc_path):
-            os.remove(local_nc_path)
-
         gc.collect()
         log_success(f"[{log_time} UTC] Frame concluído.")
         return True
@@ -351,8 +495,11 @@ def process_file_worker(args):
         log_error(f"[WORKER] Falha ao gerar a imagem do timestamp {target_ts}: {e}")
         return False
     finally:
-        if got_glm_lock and glm_cache_lock_path:
-            release_background_lock(glm_cache_lock_path)
+        if not is_glm and local_nc_path and os.path.exists(local_nc_path):
+            try:
+                os.remove(local_nc_path)
+            except OSError:
+                pass
 
 def process_satellite():
     t_start_total = time.time()
@@ -412,8 +559,6 @@ def process_satellite():
         print()
         t_start_search = time.time()
         for target in target_dates:
-            year = target.year
-            day_of_year = target.timetuple().tm_yday
             hour = target.hour
             minute = target.minute
             second = target.second
@@ -422,28 +567,27 @@ def process_satellite():
 
             found_abi_file = None
 
+            bucket_path = build_hour_path(sat_bucket, target, is_glm)
+            prefix = build_file_prefix(target, is_glm)
+
             if is_glm:
-                bucket_path = f"{sat_bucket}/GLM-L2-LCFA/{year}/{day_of_year:03d}/{hour:02d}/"
-                prefix = f"s{year:04d}{day_of_year:03d}{hour:02d}{minute:02d}{second:02d}"
-                channel_str = "GLM-L2-LCFA"
+                channel_str = GLM_PRODUCT
 
                 if glm_background_band:
-                    abi_minute = floor_to_abi_step(target).minute
-                    abi_bucket_path = f"{sat_bucket}/ABI-L2-CMIPF/{year}/{day_of_year:03d}/{hour:02d}/"
-                    abi_prefix = f"s{year:04d}{day_of_year:03d}{hour:02d}{abi_minute:02d}"
+                    abi_dt = floor_to_abi_step(target)
+                    abi_bucket_path = build_hour_path(sat_bucket, abi_dt, is_glm=False)
+                    abi_prefix = build_file_prefix(abi_dt, is_glm=False)
                     abi_ch_str = f"M6C{int(glm_background_band):02d}"
                     try:
                         abi_list = S3_fs.ls(abi_bucket_path)
                         found_abi_file = next((f for f in abi_list if abi_ch_str in f and abi_prefix in f), None)
                         if found_abi_file is None:
                             log_warning(
-                                f"Fundo ABI {abi_ch_str} das {abi_minute:02d}min não encontrado no bucket; frame sairá sem fundo."
+                                f"Fundo ABI {abi_ch_str} das {abi_dt.minute:02d}min não encontrado no bucket; frame sairá sem fundo."
                             )
                     except Exception as e:
                         log_warning(f"Falha ao buscar o fundo ABI {abi_ch_str} no bucket: {e}")
             else:
-                bucket_path = f"{sat_bucket}/ABI-L2-CMIPF/{year}/{day_of_year:03d}/{hour:02d}/"
-                prefix = f"s{year:04d}{day_of_year:03d}{hour:02d}{minute:02d}"
                 channel_str = f"M6C{channel_id:02d}"
 
             try:
@@ -462,7 +606,10 @@ def process_satellite():
             exit_fatal("Nenhum arquivo encontrado para as datas configuradas. Revise o 'config.ini'.")
 
         print()
-        log_info(f"Iniciando {num_workers} worker(s) (até {max_concurrent_downloads} downloads concorrentes cada)...")
+        log_info("Verificando os dados de mapa do Cartopy...")
+        prefetch_map_features()
+
+        log_info(f"Iniciando {num_workers} worker(s)...")
         print()
 
         success_count = 0
@@ -472,7 +619,7 @@ def process_satellite():
         t_start_images = time.time()
         with ProcessPoolExecutor(
             max_workers=num_workers,
-            initializer=_init_worker_log_collector,
+            initializer=configure_log_collector,
             initargs=(shared_log_list,),
         ) as executor:
             futures = {executor.submit(process_file_worker, t): t for t in tasks}
@@ -519,11 +666,11 @@ def process_satellite():
 
                     if video_frames:
                         time_fmt_out = "%Y%m%d_%H%M%S" if is_glm else "%Y%m%d_%H%M"
-                        video_filename = os.path.join(VIDEOS_DIR, f"satelite_{target_dates[0].strftime(time_fmt_out)}_ate_{target_dates[-1].strftime(time_fmt_out)}_fps{video_fps}.mp4")
+                        video_filename = os.path.join(VIDEOS_DIR, f"satelite_{target_dates[0].strftime(time_fmt_out)}_ate_{target_dates[-1].strftime(time_fmt_out)}.mp4")
                         video_filename = get_unique_path(video_filename)
                         ffmpeg_args = ['-crf', str(crf_value), '-preset', ffmpeg_preset, '-vf', video_scale, '-loglevel', 'error']
 
-                        log_info(f"Codificando com FFmpeg (CRF {crf_value}, scale {video_scale}).")
+                        log_info(f"Codificando com FFmpeg (CRF {crf_value} e {video_scale})...")
 
                         first_frame_img = Image.open(video_frames[0])
                         target_dimensions = first_frame_img.size
@@ -555,17 +702,20 @@ def process_satellite():
                         else:
                             log_info(f"Os frames usados foram mantidos em '{run_temp_dir}'.")
 
-                        try:
-                            if platform.system() == 'Windows':
-                                os.startfile(video_filename)
-                            elif platform.system() == 'Darwin':
-                                subprocess.run(['open', video_filename], check=True,
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            else:
-                                subprocess.run(['xdg-open', video_filename], check=True,
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        except Exception:
-                            log_warning(f"Não foi possível abrir o player de vídeo automaticamente (ambiente sem suporte gráfico?). Arquivo salvo em: {video_filename}")
+                        if open_video:
+                            try:
+                                if platform.system() == 'Windows':
+                                    os.startfile(video_filename)
+                                elif platform.system() == 'Darwin':
+                                    subprocess.run(['open', video_filename], check=True,
+                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                else:
+                                    if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+                                        raise RuntimeError('sem ambiente gráfico')
+                                    subprocess.run(['xdg-open', video_filename], check=True,
+                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            except Exception:
+                                log_warning(f"Não foi possível abrir o player de vídeo automaticamente (ambiente sem suporte gráfico?). Arquivo salvo em: {video_filename}")
                     else:
                         log_error("Nenhum frame PNG válido foi encontrado em disco para montar o vídeo, apesar de sucessos reportados. Verifique a pasta de frames.")
                 except Exception as e:
@@ -578,28 +728,11 @@ def process_satellite():
     except Exception as e:
         exit_fatal(f"Execução interrompida por um erro não tratado: {e}")
     finally:
-        if is_glm and glm_background_band and os.path.isdir(TEMP_NC_DIR):
-            leftover = [f for f in os.listdir(TEMP_NC_DIR) if f.startswith("bg_") or f.startswith("temp_bg_")]
-            if leftover:
-                log_info(f"Limpando {len(leftover)} arquivo(s) de cache de fundo GLM em '{TEMP_NC_DIR}'...")
-                for name in leftover:
-                    try:
-                        os.remove(os.path.join(TEMP_NC_DIR, name))
-                    except OSError:
-                        pass
+        if got_instance_lock:
+            _purge_temp_files(TEMP_NC_DIR, skip_names={"instance.lock"}, label="temporários desta execução")
+            if is_glm:
+                _purge_temp_files(GLM.GLM_NC_CACHE_DIR, label="do cache compartilhado do GLM")
 
-        if is_glm and os.path.isdir(GLM_NC_CACHE_DIR):
-            nc_cache_files = [f for f in os.listdir(GLM_NC_CACHE_DIR) if f.endswith(".nc")]
-            if nc_cache_files:
-                log_info(
-                    f"Limpando {len(nc_cache_files)} arquivo(s) .nc do cache compartilhado GLM "
-                    f"em '{GLM_NC_CACHE_DIR}'..."
-                )
-                for name in nc_cache_files:
-                    try:
-                        os.remove(os.path.join(GLM_NC_CACHE_DIR, name))
-                    except OSError:
-                        pass
         t_end_total = time.time()
         print()
         print("=" * 70)
@@ -642,9 +775,7 @@ def process_satellite():
             pass
 
         if got_instance_lock:
-            release_instance_lock(INSTANCE_LOCK_PATH)
+            release_file_lock(INSTANCE_LOCK_PATH)
 
 if __name__ == "__main__":
     process_satellite()
-    if sys.stdin.isatty():
-        input("\nPressione Enter para sair...")

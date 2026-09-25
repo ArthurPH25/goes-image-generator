@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import cartopy.crs as ccrs
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 from netCDF4 import Dataset
 import numpy as np
 
@@ -317,6 +318,11 @@ def _resolve_cached_background(target_dt, band_id, remote_abi_file, config, map_
     finally:
         release_file_lock(lock_path)
 
+def _add_watermark_and_title(ax, title_ax, style, title_text):
+    add_watermark(ax, style["watermark"], color=style["watermark_color"], size=style["watermark_size"])
+    if title_ax is not None:
+        add_map_title(title_ax, title_text, TITLE_FONTSIZE_PT)
+
 def generate_image(local_path, png_path, sat_name, pretty_time, config, target_dt=None,
                     remote_abi_file=None, current_gen_type="I"):
     if not target_dt:
@@ -379,79 +385,82 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, target_d
 
     background_dt = None
     band_id = None
+    fig = None
 
-    if has_background:
-        band_id = int(background_band)
-        if not goes_bands.is_valid_band(band_id):
-            log_error(f"Canal de fundo '{band_id}' inválido para o GLM. Os canais válidos vão de 1 a 16.")
-            return
+    try:
+        if has_background:
+            band_id = int(background_band)
+            if not goes_bands.is_valid_band(band_id):
+                log_error(f"Canal de fundo '{band_id}' inválido para o GLM. Os canais válidos vão de 1 a 16.")
+                return
 
-        band_data, background_dt = _resolve_cached_background(
-            target_dt, band_id, remote_abi_file, config, map_geo, current_gen_type
-        )
+            band_data, background_dt = _resolve_cached_background(
+                target_dt, band_id, remote_abi_file, config, map_geo, current_gen_type
+            )
 
-        if band_data is not None:
-            axes_sat_h, axes_sat_lon = band_data["sat_h"], band_data["sat_lon"]
-            axes_sat_req, axes_sat_rpol = band_data["sat_req"], band_data["sat_rpol"]
-        else:
-            axes_sat_h, axes_sat_lon = sat_h, sat_lon
-            axes_sat_req, axes_sat_rpol = sat_req, sat_rpol
-
-        figsize = (style["figure_width"], style["figure_height"])
-        fig, ax, geo_proj, title_ax = create_map_axes(
-            map_geo["projection"], axes_sat_lon, axes_sat_h, style["clean_mode"],
-            map_geo["target_coordinates"], figsize=figsize,
-            semi_major_axis=axes_sat_req, semi_minor_axis=axes_sat_rpol,
-        )
-
-        if band_data is not None:
-            goes_bands.draw_band_on_axes(ax, geo_proj, band_data, style)
-        else:
-            add_geo_features(ax, style)
-            log_warning(f"Prosseguindo sem o fundo C{band_id:02d} neste frame ({pretty_time}).")
-
-        if not style["clean_mode"]:
-            add_watermark(ax, style["watermark"], color=style["watermark_color"], size=style["watermark_size"])
-            glm_time_str = target_dt.strftime("%H:%M:%S")
-            background_time_str = background_dt.strftime("%H:%M")
-            base_date_str = target_dt.strftime("%d/%m/%Y")
-            title = (f"{sat_name} | GLM — Densidade de Raios ({glm_time_str} UTC) | "
-                     f"C{band_id:02d} ({background_time_str} UTC) | {base_date_str}")
-            if title_ax is not None:
-                add_map_title(title_ax, title, TITLE_FONTSIZE_PT)
-    else:
-        figsize = (style["figure_width"], style["figure_height"])
-        fig, ax, _, title_ax = create_map_axes(
-            map_geo["projection"], sat_lon, sat_h, style["clean_mode"],
-            map_geo["target_coordinates"], figsize=figsize,
-            semi_major_axis=sat_req, semi_minor_axis=sat_rpol,
-        )
-        add_geo_features(ax, style)
-
-        if not style["clean_mode"]:
-            add_watermark(ax, style["watermark"], color=style["watermark_color"], size=style["watermark_size"])
-            title = f"{sat_name} | GLM — Densidade de Raios | {target_dt.strftime('%d/%m/%Y %H:%M:%S')} UTC"
-            if title_ax is not None:
-                add_map_title(title_ax, title, TITLE_FONTSIZE_PT)
-
-    if all_lons:
-        ax.scatter(all_lons, all_lats, color=all_colors, s=all_sizes, alpha=0.9, transform=ccrs.PlateCarree(), zorder=5)
-
-    if not style["clean_mode"] and sorted_colors:
-        legend_patches = []
-        n_colors = len(sorted_colors)
-        for i, (limit, hex_color) in enumerate(sorted_colors):
-            if i + 1 < n_colors:
-                next_limit = sorted_colors[i + 1][0]
-                label = (f"< {next_limit / 60:.1f} min" if i == 0
-                          else f"{limit / 60:.1f}–{next_limit / 60:.1f} min")
+            if band_data is not None:
+                axes_sat_h, axes_sat_lon = band_data["sat_h"], band_data["sat_lon"]
+                axes_sat_req, axes_sat_rpol = band_data["sat_req"], band_data["sat_rpol"]
             else:
-                label = f"≥ {limit / 60:.1f} min"
-            label = label.replace(".", ",")
-            legend_patches.append(mpatches.Patch(color=hex_color, label=label))
+                axes_sat_h, axes_sat_lon = sat_h, sat_lon
+                axes_sat_req, axes_sat_rpol = sat_req, sat_rpol
 
-        legend = ax.legend(handles=legend_patches, loc="lower left", facecolor="black",
-                            edgecolor="white", labelcolor="white", fontsize=12)
-        legend.set_zorder(6)
+            figsize = (style["figure_width"], style["figure_height"])
+            fig, ax, geo_proj, title_ax = create_map_axes(
+                map_geo["projection"], axes_sat_lon, axes_sat_h, style["clean_mode"],
+                map_geo["target_coordinates"], figsize=figsize,
+                semi_major_axis=axes_sat_req, semi_minor_axis=axes_sat_rpol,
+            )
+
+            if band_data is not None:
+                goes_bands.draw_band_on_axes(ax, geo_proj, band_data, style)
+            else:
+                add_geo_features(ax, style)
+                log_warning(f"Prosseguindo sem o fundo C{band_id:02d} neste frame ({pretty_time}).")
+
+            if not style["clean_mode"]:
+                glm_time_str = target_dt.strftime("%H:%M:%S")
+                background_time_str = background_dt.strftime("%H:%M")
+                base_date_str = target_dt.strftime("%d/%m/%Y")
+                title_text = (f"{sat_name} | GLM — Densidade de Raios ({glm_time_str} UTC) | "
+                              f"C{band_id:02d} ({background_time_str} UTC) | {base_date_str}")
+                _add_watermark_and_title(ax, title_ax, style, title_text)
+        else:
+            figsize = (style["figure_width"], style["figure_height"])
+            fig, ax, _, title_ax = create_map_axes(
+                map_geo["projection"], sat_lon, sat_h, style["clean_mode"],
+                map_geo["target_coordinates"], figsize=figsize,
+                semi_major_axis=sat_req, semi_minor_axis=sat_rpol,
+            )
+            add_geo_features(ax, style)
+
+            if not style["clean_mode"]:
+                title_text = f"{sat_name} | GLM — Densidade de Raios | {target_dt.strftime('%d/%m/%Y %H:%M:%S')} UTC"
+                _add_watermark_and_title(ax, title_ax, style, title_text)
+
+        if all_lons:
+            ax.scatter(all_lons, all_lats, color=all_colors, s=all_sizes, alpha=0.9,
+                       transform=ccrs.PlateCarree(), zorder=5)
+
+        if not style["clean_mode"] and sorted_colors:
+            legend_patches = []
+            n_colors = len(sorted_colors)
+            for i, (limit, hex_color) in enumerate(sorted_colors):
+                if i + 1 < n_colors:
+                    next_limit = sorted_colors[i + 1][0]
+                    label = (f"< {next_limit / 60:.1f} min" if i == 0
+                              else f"{limit / 60:.1f}–{next_limit / 60:.1f} min")
+                else:
+                    label = f"≥ {limit / 60:.1f} min"
+                label = label.replace(".", ",")
+                legend_patches.append(mpatches.Patch(color=hex_color, label=label))
+
+            legend = ax.legend(handles=legend_patches, loc="lower left", facecolor="black",
+                                edgecolor="white", labelcolor="white", fontsize=12)
+            legend.set_zorder(6)
+    except Exception:
+        if fig is not None:
+            plt.close(fig)
+        raise
 
     save_figure(fig, png_path, dpi)

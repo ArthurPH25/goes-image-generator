@@ -18,19 +18,16 @@ Toda a configuração (canal, período, mapa, cores, performance) fica em `confi
 <table border="0" width="100%">
   <tr>
     <td align="center" width="33%">
-      <b>Banda 2 (Visível) + GLM</b><br>
       <img src="assets/banda2_glm.png" alt="Banda 2 com GLM" width="100%"><br>
-      <small>Banda 2 com GLM</small>
+      <small><i>Banda 2 (Visível) com GLM</i></small>
     </td>
     <td align="center" width="33%">
-      <b>Banda 7 (Infravermelho Curto)</b><br>
       <img src="assets/banda7.png" alt="Banda 7 sem GLM" width="100%"><br>
-      <small>Banda 7 sem GLM</small>
+      <small><i>Banda 7 (IR Curto) sem GLM</i></small>
     </td>
     <td align="center" width="33%">
-      <b>Banda 9 (Vapor d'Água)</b><br>
       <img src="assets/banda9.png" alt="Banda 9 sem GLM" width="100%"><br>
-      <small>Banda 9 sem GLM</small>
+      <small><i>Banda 9 (Vapor d'água) sem GLM</i></small>
     </td>
   </tr>
 </table>

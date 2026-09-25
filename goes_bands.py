@@ -215,7 +215,11 @@ def _render_common(local_path, config, band_id, map_geo, style):
         reserve_right_frac=reserve_right_frac,
     )
 
-    im = draw_band_on_axes(ax, geo_proj, band_data, style)
+    try:
+        im = draw_band_on_axes(ax, geo_proj, band_data, style)
+    except Exception:
+        plt.close(fig)
+        raise
 
     return (fig, ax, im, title_ax, band_data["is_reflectance"], band_data["band_title"],
             band_data["wavelength"], band_data["vmin"], band_data["vmax"], band_data["tick_step"])
@@ -230,17 +234,21 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, band_id)
         local_path, config, band_id, map_geo, style
     )
 
-    if not style["clean_mode"]:
-        if not is_reflectance:
-            ticks = np.arange(vmin, vmax + 1, tick_step)
-            cax = add_colorbar_axes(fig, ax, fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
-            colorbar = plt.colorbar(im, cax=cax, orientation="vertical", ticks=ticks)
-            colorbar.ax.set_yticklabels([f"{tick}°C" for tick in ticks], color="white", size=10)
-            colorbar.outline.set_edgecolor("white")
+    try:
+        if not style["clean_mode"]:
+            if not is_reflectance:
+                ticks = np.arange(vmin, vmax + 1, tick_step)
+                cax = add_colorbar_axes(fig, ax, fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD)
+                colorbar = plt.colorbar(im, cax=cax, orientation="vertical", ticks=ticks)
+                colorbar.ax.set_yticklabels([f"{tick}°C" for tick in ticks], color="white", size=10)
+                colorbar.outline.set_edgecolor("white")
 
-        add_watermark(ax, style["watermark"], color=style["watermark_color"], size=style["watermark_size"])
-        if title_ax is not None:
-            title_text = f"{sat_name} | C{band_id:02d} — {band_title} ({wavelength} µm) | {pretty_time} UTC"
-            add_map_title(title_ax, title_text, TITLE_FONTSIZE_PT)
+            add_watermark(ax, style["watermark"], color=style["watermark_color"], size=style["watermark_size"])
+            if title_ax is not None:
+                title_text = f"{sat_name} | C{band_id:02d} — {band_title} ({wavelength} µm) | {pretty_time} UTC"
+                add_map_title(title_ax, title_text, TITLE_FONTSIZE_PT)
+    except Exception:
+        plt.close(fig)
+        raise
 
     save_figure(fig, png_path, dpi)

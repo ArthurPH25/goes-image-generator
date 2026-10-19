@@ -2,8 +2,8 @@ numpy
 netCDF4
 s3fs
 botocore
-matplotlib
+matplotlib>=3.5
 cartopy
-Pillow
+Pillow>=9.1
 imageio
 imageio-ffmpeg

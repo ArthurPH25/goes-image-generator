@@ -28,8 +28,8 @@ import imageio.v2 as imageio
 import numpy as np
 import s3fs
 
-import goes_bands
-import GLM
+from products import core, registry, pipeline
+from products import glm as GLM
 from utils import (
     get_satellite_info,
     log_error,
@@ -37,7 +37,6 @@ from utils import (
     log_info,
     acquire_file_lock,
     release_file_lock,
-    validate_color,
     LOG_COLLECTOR_STATE,
     floor_to_abi_step,
     read_map_geometry_config,
@@ -47,24 +46,25 @@ from utils import (
     ABI_STEP_MINUTES,
     GLM_STEP_SECONDS,
 )
-from S3_downloader import download_batch, build_hour_path, build_file_prefix, GLM_PRODUCT
+from S3_downloader import download_batch, download_sources, build_hour_path, build_file_prefix
 
 warnings.filterwarnings("ignore")
 
 INSTANCE_LOCK_STALE_TIMEOUT_S = 24 * 60 * 60
 
+
 def configure_log_collector(shared_list):
     LOG_COLLECTOR_STATE["collector"] = shared_list
 
-def log_fatal(message):
-    print(f"☠️ ERRO FATAL: {message}")
 
 def exit_fatal(message):
-    log_fatal(message)
+    print(f"☠️ ERRO FATAL: {message}")
     sys.exit(1)
+
 
 def log_success(message):
     print(f"✅ {message}")
+
 
 def format_elapsed_time(seconds):
     if seconds < 1:
@@ -77,19 +77,17 @@ def format_elapsed_time(seconds):
         return f"{minutes}m {secs}s"
     return f"{secs}s"
 
+
 def parse_datetime(date_str, time_str, require_seconds):
     full_str = f"{date_str} {time_str}"
     has_seconds = time_str.count(":") == 2
     if require_seconds and not has_seconds:
-        raise ValueError(
-            f"horário '{time_str}' sem segundos: canal GLM exige o formato HH:MM:SS"
-        )
+        raise ValueError(f"horário '{time_str}' sem segundos: o produto GLM exige o formato HH:MM:SS")
     if not require_seconds and has_seconds:
-        raise ValueError(
-            f"horário '{time_str}' com segundos: canal ABI exige o formato HH:MM, sem segundos"
-        )
+        raise ValueError(f"horário '{time_str}' com segundos: este produto exige o formato HH:MM, sem segundos")
     time_format = "%H:%M:%S" if has_seconds else "%H:%M"
     return datetime.strptime(full_str, f"%Y-%m-%d {time_format}").replace(tzinfo=timezone.utc)
+
 
 def get_unique_path(desired_path):
     if not os.path.exists(desired_path):
@@ -102,23 +100,6 @@ def get_unique_path(desired_path):
             return candidate
         counter += 1
 
-def acquire_instance_lock(lock_path):
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.write(fd, str(time.time()).encode("utf-8"))
-        os.close(fd)
-        return True
-    except FileExistsError:
-        try:
-            with open(lock_path, "r", encoding="utf-8") as f:
-                lock_time = float(f.read().strip())
-            if time.time() - lock_time > INSTANCE_LOCK_STALE_TIMEOUT_S:
-                log_warning("Lock de instância obsoleto encontrado (execução anterior travou sem limpar). Assumindo e continuando.")
-                os.remove(lock_path)
-                return acquire_instance_lock(lock_path)
-        except Exception:
-            pass
-        return False
 
 def _purge_temp_files(dir_path, skip_names=frozenset(), label=""):
     if not os.path.isdir(dir_path):
@@ -136,13 +117,13 @@ def _purge_temp_files(dir_path, skip_names=frozenset(), label=""):
     if removed:
         log_info(f"Limpando {removed} arquivo(s) {label} em '{dir_path}'...")
 
+
 def _get_positive_int(config, section, key):
     value = config.getint(section, key)
     if value < 1:
-        raise ValueError(
-            f"{key} em [{section}] deve ser um número inteiro maior ou igual a 1, recebido: {value}"
-        )
+        raise ValueError(f"{key} em [{section}] deve ser um número inteiro maior ou igual a 1, recebido: {value}")
     return value
+
 
 def prefetch_map_features(resolution="10m"):
     for feature in (cfeature.STATES, cfeature.BORDERS, cfeature.COASTLINE):
@@ -154,85 +135,44 @@ def prefetch_map_features(resolution="10m"):
                 "Na primeira execução é preciso ter internet para o Cartopy baixá-lo."
             )
 
-def validate_palette_section(config, section, min_keys=2):
-    if not config.has_section(section):
-        raise ValueError(f"seção '[{section}]' ausente em colors.ini")
-    items = config.items(section)
-    if len(items) < min_keys:
-        raise ValueError(
-            f"seção '[{section}]' precisa de pelo menos {min_keys} chaves de temperatura "
-            f"diferentes para interpolar cores, encontrada(s) {len(items)}"
-        )
-    for key, value in items:
-        try:
-            int(key)
-        except ValueError:
-            raise ValueError(
-                f"chave '{key}' na seção '[{section}]' não é um número inteiro válido "
-                "(valores físicos devem ser inteiros, ex: -63, não -63.5 nem 'default')"
-            )
-        validate_color(f"[{section}] chave {key}", value)
 
-def validate_glm_palette_section(config, require_age_keys):
-    section = "PALETTE_GLM"
-    if not config.has_section(section):
-        raise ValueError(f"seção '[{section}]' ausente em colors.ini, obrigatória para o canal GLM")
-    if not config.has_option(section, "default"):
-        raise ValueError(f"chave 'default' ausente na seção '[{section}]'")
-    validate_color(f"[{section}] chave default", config.get(section, "default"))
-    for key, _ in config.items(section):
-        if key != "default" and not (key.isascii() and key.isdigit()):
-            raise ValueError(
-                f"chave '{key}' na seção '[{section}]' inválida: use 'default' ou uma idade inteira "
-                "em segundos (ex: 150)"
-            )
-    numeric_items = [(k, v) for k, v in config.items(section) if k.isdigit()]
-    if require_age_keys and not numeric_items:
-        raise ValueError(
-            f"glm_flash_age = True exige ao menos uma chave numérica de idade em [{section}]"
-        )
-    for key, value in numeric_items:
-        validate_color(f"[{section}] chave {key}", value)
-
-def compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi):
+def compute_render_signature(config, colors_config, product_key, dpi):
     map_geo = read_map_geometry_config(config)
     style = read_style_config(config)
 
-    bands_for_palette = set()
-    if is_glm:
-        if glm_background_band:
-            bands_for_palette.add(int(glm_background_band))
-    elif not (1 <= channel_id <= 6):
-        bands_for_palette.add(channel_id)
+    glm_signature_extra = None
 
-    palette_data = {}
-    if is_glm:
-        if config.has_section("PALETTE_GLM"):
-            palette_data["GLM"] = sorted(config.items("PALETTE_GLM"))
-    for band_id in sorted(bands_for_palette):
-        section = f"PALETTE_BAND_{band_id:02d}"
-        if config.has_section(section):
-            palette_data[section] = sorted(config.items(section))
-
-    glm_flash_age = config.getboolean("MAP", "glm_flash_age") if is_glm else None
-    glm_history_lookback_steps = (
-        config.getint("PROCESSING", "glm_history_lookback_steps")
-        if (is_glm and glm_flash_age) else None
-    )
+    if product_key == "GLM":
+        glm_cfg = GLM.read_glm_config(config)
+        palette_section = "PALETTE_GLM" if glm_cfg["render_mode"] == "POINTS" else "PALETTE_GLM_DENSITY"
+        palette_data = {palette_section: sorted(colors_config.items(palette_section))}
+        if glm_cfg["background"]:
+            palette_data.update(registry.palette_snapshot(glm_cfg["background"], colors_config))
+        glm_signature_extra = {
+            "render_mode": glm_cfg["render_mode"],
+            "flash_age": glm_cfg["flash_age"],
+            "density_grid_resolution_km": glm_cfg["density_grid_resolution_km"],
+            "background": glm_cfg["background"],
+            "flash_marker_min": glm_cfg["flash_marker_min"],
+            "flash_marker_max": glm_cfg["flash_marker_max"],
+            "glm_history_lookback_steps": (
+                config.getint("PROCESSING", "glm_history_lookback_steps") if glm_cfg["flash_age"] else None
+            ),
+        }
+    else:
+        palette_data = registry.palette_snapshot(product_key, colors_config)
 
     signature_payload = {
-        "channel": "GLM" if is_glm else channel_id,
-        "glm_background_band": glm_background_band if is_glm else None,
-        "glm_flash_age": glm_flash_age,
-        "glm_history_lookback_steps": glm_history_lookback_steps,
+        "product": product_key,
+        "glm": glm_signature_extra,
         "dpi": dpi,
         "map_geo": map_geo,
         "style": style,
         "palette_data": palette_data,
     }
     payload_json = json.dumps(signature_payload, sort_keys=True, default=str)
-    digest = hashlib.sha1(payload_json.encode("utf-8")).hexdigest()[:12]
-    return digest
+    return hashlib.sha1(payload_json.encode("utf-8")).hexdigest()[:12]
+
 
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 COLORS_PATH = os.path.join(BASE_DIR, "colors.ini")
@@ -243,24 +183,28 @@ TEMP_IMAGES_DIR = os.path.join(BASE_DIR, "satelite_temp_images")
 INSTANCE_LOCK_PATH = os.path.join(TEMP_NC_DIR, "instance.lock")
 
 config = configparser.ConfigParser(interpolation=None)
+colors_config = configparser.ConfigParser(interpolation=None)
 try:
-    _files_read = config.read([COLORS_PATH, CONFIG_PATH], encoding="utf-8")
+    _config_files_read = config.read([CONFIG_PATH], encoding="utf-8")
+    _colors_files_read = colors_config.read([COLORS_PATH], encoding="utf-8")
 except (configparser.Error, UnicodeDecodeError) as e:
     exit_fatal(
         f"Não foi possível ler 'colors.ini'/'config.ini': {e}\n"
         "Confira: cada chave aparece só uma vez por seção, toda seção tem cabeçalho [NOME], "
         "comentários ficam em linhas próprias (começando com #) e os arquivos estão salvos em UTF-8."
     )
-if len(_files_read) < 2:
+if not _config_files_read or not _colors_files_read:
     exit_fatal("Arquivo 'colors.ini' e/ou 'config.ini' não encontrado no diretório do script.")
 
 try:
-    channel_raw = config.get("GENERAL", "channel").strip().upper()
-    is_glm = (channel_raw == "GLM")
-    channel_id = "GLM" if is_glm else int(channel_raw)
-
-    if not is_glm and not goes_bands.is_valid_band(channel_id):
-        exit_fatal(f"Canal '{channel_id}' inválido. Os canais válidos vão de 1 a 16, ou 'GLM'.")
+    product_key = config.get("GENERAL", "product").strip().upper()
+    if not registry.is_valid_product_key(product_key):
+        exit_fatal(
+            f"product '{product_key}' inválido. Veja a lista de valores aceitos nos comentários de "
+            "[GENERAL] em config.ini."
+        )
+    product_spec = registry.get_product(product_key)
+    is_glm = product_key == "GLM"
 
     gen_type = config.get("GENERAL", "generation_type").strip().upper()
     if gen_type not in ["I", "V"]:
@@ -292,7 +236,7 @@ try:
         try:
             crf_int = int(crf_value)
         except ValueError:
-            raise ValueError(f"crf '{crf_value}' deve ser um número inteiro")
+            raise ValueError(f"crf '{crf_value}' deve ser um número inteiro") from None
         if not (0 <= crf_int <= 51):
             raise ValueError(f"crf '{crf_value}' fora do intervalo válido do FFmpeg (0 a 51)")
         if not re.match(r"^scale=-?\d+:-?\d+$", video_scale.strip()):
@@ -301,30 +245,20 @@ try:
                 "(use -2 na dimensão que deve manter a proporção, ex: scale=1920:-2)"
             )
 
-    glm_background_band = config.get("MAP", "glm_background_band").strip()
-    glm_flash_age = config.getboolean("MAP", "glm_flash_age")
+    map_geo = read_map_geometry_config(config)
+    core.visible_boundary_angles(
+        map_geo["target_coordinates"], core.GOES_EAST_SATELLITE_LON_DEG, core.GOES_EAST_SATELLITE_HEIGHT_M,
+        core.GRS80_SEMI_MAJOR_AXIS_M, core.GRS80_SEMI_MINOR_AXIS_M,
+    )
+    read_style_config(config)
 
-    if glm_background_band:
-        try:
-            bg_band_id = int(glm_background_band)
-        except ValueError:
-            raise ValueError(
-                "glm_background_band deve ser um número inteiro de canal (1 a 16) ou vazio, "
-                f"recebido: '{glm_background_band}'"
-            )
-        if not goes_bands.is_valid_band(bg_band_id):
-            raise ValueError(
-                f"glm_background_band '{bg_band_id}' inválido. Os canais válidos vão de 1 a 16."
-            )
-        if not (1 <= bg_band_id <= 6):
-            validate_palette_section(config, f"PALETTE_BAND_{bg_band_id:02d}")
-
+    glm_cfg = None
     if is_glm:
-        validate_glm_palette_section(config, require_age_keys=glm_flash_age)
-    elif not (1 <= channel_id <= 6):
-        validate_palette_section(config, f"PALETTE_BAND_{channel_id:02d}")
+        glm_cfg = GLM.validate_glm_config(config, colors_config)
+    else:
+        registry.validate_product_colors(product_key, colors_config)
 
-    render_signature = compute_render_signature(config, channel_id, is_glm, glm_background_band, dpi)
+    render_signature = compute_render_signature(config, colors_config, product_key, dpi)
     run_temp_dir = os.path.join(TEMP_IMAGES_DIR, render_signature)
     output_dir = IMAGES_DIR if gen_type == "I" else run_temp_dir
 
@@ -337,10 +271,10 @@ try:
 
         if is_glm:
             if target_dt.second % GLM_STEP_SECONDS != 0:
-                raise ValueError("Canal GLM exige segundos múltiplos de 20 (00, 20 ou 40).")
+                raise ValueError("O produto GLM exige segundos múltiplos de 20 (00, 20 ou 40).")
         else:
             if target_dt.minute % ABI_STEP_MINUTES != 0:
-                raise ValueError("Canal ABI exige minutos múltiplos de 10 (imagem a cada 10 minutos).")
+                raise ValueError("Este produto exige minutos múltiplos de 10 (imagem a cada 10 minutos).")
 
         target_dates.append(target_dt)
     else:
@@ -358,7 +292,7 @@ try:
                 raise ValueError("Início e fim do vídeo GLM exigem segundos múltiplos de 20 (00, 20 ou 40).")
         else:
             if start_dt.minute % ABI_STEP_MINUTES != 0 or end_dt.minute % ABI_STEP_MINUTES != 0:
-                raise ValueError("Início e fim do vídeo ABI exigem minutos múltiplos de 10.")
+                raise ValueError("Início e fim do vídeo exigem minutos múltiplos de 10.")
 
         if end_dt <= start_dt:
             raise ValueError(
@@ -380,8 +314,10 @@ except Exception as e:
         "do valor. Mova o comentário para uma linha própria."
     )
 
-def build_png_name(remote_file):
-    return remote_file.split("/")[-1].replace(".nc", ".png")
+
+def build_png_name(product_key, pretty_time):
+    return f"{product_key}_{pretty_time}.png"
+
 
 def _is_valid_png(path):
     try:
@@ -391,115 +327,111 @@ def _is_valid_png(path):
     except Exception:
         return False
 
-def process_file_worker(args):
-    remote_file, remote_abi_file, output_path, sat_name, target_ts, current_gen_type = args
-    target_dt = datetime.fromtimestamp(target_ts, tz=timezone.utc)
 
-    local_nc_path = None
+def _find_source_file(s3_fs, sat_bucket, dt, source):
+    bucket_path = build_hour_path(sat_bucket, dt, source.product_code)
+    prefix = build_file_prefix(dt, source.product_code)
+    token = f"M6C{source.band:02d}" if source.band is not None else source.product_code
     try:
-        file_name = remote_file.split("/")[-1]
-        png_path = os.path.join(output_path, build_png_name(remote_file))
+        files_list = s3_fs.ls(bucket_path)
+    except Exception as e:
+        log_error(f"Falha ao listar {bucket_path}: {e}")
+        return None
+    return next((f for f in files_list if token in f and prefix in f), None)
 
-        if current_gen_type == "I":
-            png_path = get_unique_path(png_path)
 
+def process_file_worker(task):
+    target_dt = datetime.fromtimestamp(task["target_ts"], tz=timezone.utc)
+    current_gen_type = task["current_gen_type"]
+    output_path = task["output_path"]
+    sat_name = task["sat_name"]
+
+    pretty_time = target_dt.strftime("%Y%j%H%M%S") if is_glm else target_dt.strftime("%Y%j%H%M")
+    log_time = pretty_time
+    png_name = build_png_name(product_key, pretty_time)
+    png_path = os.path.join(output_path, png_name)
+
+    if current_gen_type == "I":
+        png_path = get_unique_path(png_path)
+
+    if current_gen_type == "V" and os.path.exists(png_path):
+        if _is_valid_png(png_path):
+            log_info(f"[{log_time} UTC] Frame já existe no cache. Pulando.")
+            return True
+        log_warning(f"[{log_time} UTC] Frame em cache estava corrompido (execução anterior interrompida?). Regenerando.")
+        os.remove(png_path)
+
+    local_paths = None
+    try:
         if is_glm:
-            pretty_time = target_dt.strftime("%Y%j%H%M%S")
-        else:
-            pretty_time = target_dt.strftime("%Y%j%H%M")
-
-        log_time = pretty_time
-
-        if current_gen_type == "V" and os.path.exists(png_path):
-            if _is_valid_png(png_path):
-                log_info(f"[{log_time} UTC] Frame já existe no cache. Pulando.")
-                return True
-            log_warning(f"[{log_time} UTC] Frame em cache estava corrompido (execução anterior interrompida?). Regenerando.")
-            os.remove(png_path)
-
-        if is_glm:
+            glm_source_id = "GLM"
+            remote_glm_path = task["main_remote_paths"][glm_source_id]
+            cache_path, glm_cache_lock_path = GLM.glm_nc_cache_paths(GLM.GLM_NC_CACHE_DIR, remote_glm_path)
             os.makedirs(GLM.GLM_NC_CACHE_DIR, exist_ok=True)
-            cache_path, glm_cache_lock_path = GLM.glm_nc_cache_paths(GLM.GLM_NC_CACHE_DIR, remote_file)
-            local_nc_path = cache_path
             if os.path.exists(cache_path):
                 log_info(f"[{log_time} UTC] NetCDF principal já em cache (reaproveitado de outro frame).")
             else:
                 got_glm_lock = acquire_file_lock(glm_cache_lock_path)
                 try:
-                    if os.path.exists(cache_path):
-                        log_info(f"[{log_time} UTC] NetCDF principal já em cache (reaproveitado de outro frame).")
-                    else:
+                    if not os.path.exists(cache_path):
                         if not got_glm_lock:
                             log_warning(
                                 f"[{log_time} UTC] Timeout esperando lock do NetCDF principal do GLM; "
                                 "baixando mesmo assim (protegido por arquivo temporário atômico)."
                             )
                         tmp_download_path = f"{cache_path}.part_{os.getpid()}"
-                        batch = [{
-                            "remote_path": remote_file,
+                        log_info(f"[{log_time} UTC] Baixando o NetCDF principal.")
+                        results = download_batch([{
+                            "remote_path": remote_glm_path,
                             "local_path": tmp_download_path,
                             "required_variables": GLM.GLM_REQUIRED_VARS,
                             "label": f"{log_time} principal",
-                        }]
-                        log_info(f"[{log_time} UTC] Baixando o NetCDF principal.")
-                        try:
-                            results = download_batch(batch)
-                            main_ok, main_msg = results[remote_file]
-                            if not main_ok:
-                                raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
-                            if os.path.exists(cache_path):
-                                os.remove(tmp_download_path)
-                            else:
-                                os.replace(tmp_download_path, cache_path)
-                        except Exception:
-                            if os.path.exists(tmp_download_path):
-                                try:
-                                    os.remove(tmp_download_path)
-                                except OSError:
-                                    pass
-                            raise
+                        }])
+                        main_ok, main_msg = results[remote_glm_path]
+                        if not main_ok:
+                            raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
+                        if os.path.exists(cache_path):
+                            os.remove(tmp_download_path)
+                        else:
+                            os.replace(tmp_download_path, cache_path)
                 finally:
                     if got_glm_lock:
                         release_file_lock(glm_cache_lock_path)
-                        got_glm_lock = False
-        else:
-            local_nc_path = os.path.join(TEMP_NC_DIR, f"temp_{file_name}")
-            batch = [{
-                "remote_path": remote_file,
-                "local_path": local_nc_path,
-                "required_variables": goes_bands.ABI_REQUIRED_VARS,
-                "label": f"{log_time} principal",
-            }]
-            log_info(f"[{log_time} UTC] Baixando o NetCDF principal.")
-            results = download_batch(batch)
-            main_ok, main_msg = results[remote_file]
-            if not main_ok:
-                raise Exception(f"Falha ao baixar o NetCDF principal: {main_msg}")
 
-        log_info(f"[{log_time} UTC] Processando dados e salvando PNG.")
-
-        if is_glm:
-            GLM.generate_image(local_nc_path, png_path, sat_name, pretty_time, config,
-                                 target_dt=target_dt, remote_abi_file=remote_abi_file,
-                                 current_gen_type=current_gen_type)
+            log_info(f"[{log_time} UTC] Processando dados e salvando PNG.")
+            GLM.generate_image(
+                cache_path, png_path, sat_name, pretty_time, config, colors_config,
+                target_dt=target_dt, remote_background_files=task["background_remote_paths"],
+                current_gen_type=current_gen_type,
+            )
         else:
-            goes_bands.generate_image(local_nc_path, png_path, sat_name, pretty_time, config, channel_id)
+            local_paths = download_sources(task["main_remote_paths"], TEMP_NC_DIR, "temp_", f"[{log_time} UTC] principal")
+            if local_paths is None:
+                raise Exception("Falha ao baixar um ou mais arquivos principais deste produto.")
+
+            log_info(f"[{log_time} UTC] Processando dados e salvando PNG.")
+            pipeline.generate_standalone_image(
+                product_spec, local_paths, sat_name, config, colors_config, png_path, target_dt
+            )
 
         if not os.path.exists(png_path):
-            raise Exception("O módulo do canal não gerou o PNG esperado (falha silenciosa).")
+            raise Exception("O módulo do produto não gerou o PNG esperado (falha silenciosa).")
 
         gc.collect()
         log_success(f"[{log_time} UTC] Frame concluído.")
         return True
     except Exception as e:
-        log_error(f"[WORKER] Falha ao gerar a imagem do timestamp {target_ts}: {e}")
+        log_error(f"[WORKER] Falha ao gerar a imagem do timestamp {task['target_ts']}: {e}")
         return False
     finally:
-        if not is_glm and local_nc_path and os.path.exists(local_nc_path):
-            try:
-                os.remove(local_nc_path)
-            except OSError:
-                pass
+        if not is_glm and local_paths:
+            for path in local_paths.values():
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
 
 def process_satellite():
     t_start_total = time.time()
@@ -523,7 +455,9 @@ def process_satellite():
         if gen_type == "V":
             os.makedirs(VIDEOS_DIR, exist_ok=True)
 
-        got_instance_lock = acquire_instance_lock(INSTANCE_LOCK_PATH)
+        got_instance_lock = acquire_file_lock(
+            INSTANCE_LOCK_PATH, stale_timeout_s=INSTANCE_LOCK_STALE_TIMEOUT_S, max_wait_s=0
+        )
         if not got_instance_lock:
             exit_fatal(
                 "Já existe outra execução deste script em andamento nesta pasta "
@@ -533,14 +467,16 @@ def process_satellite():
                 "tiver certeza de que não há nenhuma rodando, apague o arquivo de lock manualmente."
             )
 
-        if is_glm and glm_background_band:
-            channel_label = f"GLM (fundo {glm_background_band})"
+        if is_glm and glm_cfg["background"]:
+            product_label = f"GLM (fundo {glm_cfg['background']}, {glm_cfg['render_mode']})"
+        elif is_glm:
+            product_label = f"GLM ({glm_cfg['render_mode']})"
         else:
-            channel_label = str(channel_id)
+            product_label = product_key
 
         print("=" * 70)
         print("🛰️ GERADOR DE IMAGENS DE SATÉLITE 🛰️")
-        print(f"Modo: {'Vídeo' if gen_type == 'V' else 'Imagem Única'} | Canal Ativo: {channel_label}")
+        print(f"Modo: {'Vídeo' if gen_type == 'V' else 'Imagem Única'} | Produto Ativo: {product_label}")
         print(f"Alvo: {config.get('MAP', 'target_coordinates')}")
         if gen_type == "V":
             print(f"Pasta de frames desta execução: {run_temp_dir}")
@@ -558,48 +494,51 @@ def process_satellite():
         log_info("Buscando os arquivos no bucket S3 da NOAA...")
         print()
         t_start_search = time.time()
-        for target in target_dates:
-            hour = target.hour
-            minute = target.minute
-            second = target.second
 
+        background_spec = None
+        if is_glm and glm_cfg["background"]:
+            background_spec = registry.get_product(glm_cfg["background"])
+
+        for target in target_dates:
             sat_bucket, sat_name = get_satellite_info(target)
 
-            found_abi_file = None
+            sources = product_spec.sources
 
-            bucket_path = build_hour_path(sat_bucket, target, is_glm)
-            prefix = build_file_prefix(target, is_glm)
+            main_remote_paths = {}
+            all_found = True
+            for source in sources:
+                found = _find_source_file(S3_fs, sat_bucket, target, source)
+                main_remote_paths[source.source_id] = found
+                if not found:
+                    all_found = False
 
-            if is_glm:
-                channel_str = GLM_PRODUCT
+            background_remote_paths = {}
+            if background_spec is not None:
+                background_dt = floor_to_abi_step(target)
+                bg_sat_bucket, _ = get_satellite_info(background_dt)
+                for source in background_spec.sources:
+                    found = _find_source_file(S3_fs, bg_sat_bucket, background_dt, source)
+                    background_remote_paths[source.source_id] = found
+                if not all(background_remote_paths.values()):
+                    log_warning(
+                        f"Fundo {glm_cfg['background']} das {background_dt.strftime('%H:%M')} UTC incompleto no "
+                        "bucket; frame sairá sem fundo."
+                    )
 
-                if glm_background_band:
-                    abi_dt = floor_to_abi_step(target)
-                    abi_bucket_path = build_hour_path(sat_bucket, abi_dt, is_glm=False)
-                    abi_prefix = build_file_prefix(abi_dt, is_glm=False)
-                    abi_ch_str = f"M6C{int(glm_background_band):02d}"
-                    try:
-                        abi_list = S3_fs.ls(abi_bucket_path)
-                        found_abi_file = next((f for f in abi_list if abi_ch_str in f and abi_prefix in f), None)
-                        if found_abi_file is None:
-                            log_warning(
-                                f"Fundo ABI {abi_ch_str} das {abi_dt.minute:02d}min não encontrado no bucket; frame sairá sem fundo."
-                            )
-                    except Exception as e:
-                        log_warning(f"Falha ao buscar o fundo ABI {abi_ch_str} no bucket: {e}")
-            else:
-                channel_str = f"M6C{channel_id:02d}"
+            if not all_found:
+                missing = [s.source_id for s in sources if not main_remote_paths[s.source_id]]
+                log_warning(f"Arquivo(s) {', '.join(missing)} de {target.strftime('%H:%M:%S')} não encontrado(s) no bucket.")
+                continue
 
-            try:
-                files_list = S3_fs.ls(bucket_path)
-                found_file = next((f for f in files_list if channel_str in f and prefix in f), None)
-                if found_file:
-                    tasks.append((found_file, found_abi_file, output_dir, sat_name, target.replace(tzinfo=timezone.utc).timestamp(), gen_type))
-                    log_success(f"Encontrado: {found_file.split('/')[-1]}")
-                else:
-                    log_warning(f"Arquivo das {hour:02d}:{minute:02d}:{second:02d} não encontrado no bucket.")
-            except Exception as e:
-                log_error(f"Falha ao listar {bucket_path}: {e}")
+            tasks.append({
+                "target_ts": target.replace(tzinfo=timezone.utc).timestamp(),
+                "main_remote_paths": main_remote_paths,
+                "background_remote_paths": background_remote_paths,
+                "sat_name": sat_name,
+                "output_path": output_dir,
+                "current_gen_type": gen_type,
+            })
+            log_success(f"Encontrado: {target.strftime('%H:%M:%S')} UTC ({', '.join(main_remote_paths)})")
         t_end_search = time.time()
 
         if not tasks:
@@ -652,8 +591,9 @@ def process_satellite():
                     video_frames = []
                     skipped_corrupt = 0
                     for task in tasks:
-                        expected_name = build_png_name(task[0])
-                        frame_path = os.path.join(output_dir, expected_name)
+                        target_dt = datetime.fromtimestamp(task["target_ts"], tz=timezone.utc)
+                        pretty_time = target_dt.strftime("%Y%j%H%M%S") if is_glm else target_dt.strftime("%Y%j%H%M")
+                        frame_path = os.path.join(output_dir, build_png_name(product_key, pretty_time))
                         if not os.path.exists(frame_path):
                             continue
                         if _is_valid_png(frame_path):
@@ -666,7 +606,12 @@ def process_satellite():
 
                     if video_frames:
                         time_fmt_out = "%Y%m%d_%H%M%S" if is_glm else "%Y%m%d_%H%M"
-                        video_filename = os.path.join(VIDEOS_DIR, f"satelite_{target_dates[0].strftime(time_fmt_out)}_ate_{target_dates[-1].strftime(time_fmt_out)}.mp4")
+                        first_dt = datetime.fromtimestamp(tasks[0]["target_ts"], tz=timezone.utc)
+                        last_dt = datetime.fromtimestamp(tasks[-1]["target_ts"], tz=timezone.utc)
+                        video_filename = os.path.join(
+                            VIDEOS_DIR,
+                            f"satelite_{product_key}_{first_dt.strftime(time_fmt_out)}_a_{last_dt.strftime(time_fmt_out)}.mp4",
+                        )
                         video_filename = get_unique_path(video_filename)
                         ffmpeg_args = ['-crf', str(crf_value), '-preset', ffmpeg_preset, '-vf', video_scale, '-loglevel', 'error']
 
@@ -686,11 +631,7 @@ def process_satellite():
 
                                 img_object = Image.open(frame_path)
                                 if img_object.size != target_dimensions:
-                                    try:
-                                        resampling_filter = Image.Resampling.LANCZOS
-                                    except AttributeError:
-                                        resampling_filter = Image.LANCZOS
-                                    img_object = img_object.resize(target_dimensions, resampling_filter)
+                                    img_object = img_object.resize(target_dimensions, Image.Resampling.LANCZOS)
                                 video_writer.append_data(np.array(img_object))
                                 img_object.close()
 
@@ -724,6 +665,8 @@ def process_satellite():
                     t_end_video = time.time()
             else:
                 exit_fatal("O modo configurado é de vídeo, mas nenhuma imagem foi gerada. Não é possível montar o vídeo.")
+        elif success_count == 0:
+            exit_fatal("A imagem não foi gerada. Revise os erros acima.")
 
     except Exception as e:
         exit_fatal(f"Execução interrompida por um erro não tratado: {e}")
@@ -776,6 +719,7 @@ def process_satellite():
 
         if got_instance_lock:
             release_file_lock(INSTANCE_LOCK_PATH)
+
 
 if __name__ == "__main__":
     process_satellite()

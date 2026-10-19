@@ -1,33 +1,73 @@
 # GOES Image Generator
 
-Gera imagens e vídeos a partir dos satélites GOES-16/GOES-19 (bandas ABI 1-16 e GLM), focado na América do Sul. Baixa os NetCDF direto do bucket público da NOAA na AWS (acesso anônimo, sem credenciais), recorta a região configurada, aplica as paletas de `colors.ini` e renderiza com matplotlib/cartopy. Dá pra gerar uma imagem única ou montar um vídeo com FFmpeg.
+Gera imagens e vídeos a partir dos satélites GOES-16/GOES-19, focado na América do Sul. Baixa os NetCDF direto do bucket público da NOAA na AWS (acesso anônimo, sem credenciais), recorta a região configurada, aplica as paletas/receitas de `colors.ini` e renderiza com matplotlib/cartopy. Dá pra gerar uma imagem única ou montar um vídeo com FFmpeg.
 
-Toda a configuração (canal, período, mapa, cores, performance) fica em `config.ini` e `colors.ini`, com explicações sobre todos os parâmetros. Esse README basicamente cobre o que os `.ini` não explicam.
+Toda a configuração (produto, período, mapa, cores, performance) fica em `config.ini` e `colors.ini`, com explicações sobre todos os parâmetros. Esse README cobre o que os `.ini` não explicam: a arquitetura por trás de `product =`.
 
 ---
 
-### Exemplo de Animação 
+## O que o projeto suporta
+
+Bandas ABI individuais: `C01` a `C16`. C01-C06 (refletância) saem em cinza; C07-C16 usam a paleta em `[PALETTE_C07..16]`.
+
+Multiespectrais: `GEOCOLOR` (aproximação true-color/IR do produto CIRA GeoColor) e `SPLIT_WINDOW` (C13 - C15).
+
+Composições RGB: `AIRMASS`, `DAY_CLOUD_PHASE`, `NIGHT_MICROPHYSICS`, `SEVERE_STORMS`, `OVERSHOOTING_TOPS`, `FIRE_TEMPERATURE`. Cada uma é uma receita em `colors.ini` (faixa física, gama e inversão são livres; as bandas só podem variar entre as que o produto já baixa, lista no topo da seção RGB de `colors.ini`), não código fixo.
+
+Produtos de nuvem: `CLOUD_TOP_HEIGHT` (produto oficial `ABI-L2-ACHAF`) e `CLOUD_BASE_HEIGHT`/`CLOUD_THICKNESS`, que são estimativas deste projeto (veja o aviso em `colors.ini` e "Limitações conhecidas" abaixo).
+
+GLM: `product = GLM`, configurado na seção `[GLM]` de `config.ini`. Dois modos (`render_mode`): `POINTS` (raios individuais, cor/tamanho por idade) e `DENSITY` (grade 2D de contagem de raios). Nos dois modos, `[GLM] background` aceita qualquer produto da lista acima como plano de fundo, inclusive outra composição RGB, o GEOCOLOR ou um produto de nuvem.
+
+Só existem imagens ABI "Full Disk" (disco completo) a cada 10 minutos, modo de escaneamento 6 (GOES-16 só passou a esse modo em abril/2019; CONUS e mesoescala não são suportados). GLM (`GLM-L2-LCFA`) tem um arquivo a cada 20 segundos. Troca automática de satélite: antes de 2025-04-07 15:10 UTC usa o GOES-16; a partir daí, o GOES-19.
+
+### Produtos e arquivos que cada um baixa
+
+Cada frame baixa os NetCDF listados abaixo (um por linha da coluna "Arquivos"). Quanto mais arquivos, mais RAM e rede por worker, então ajuste `num_workers` olhando esta tabela.
+
+| `product =` | Arquivos por frame | Quando faz sentido |
+|---|---|---|
+| `C01` a `C06` | 1 banda ABI (`CMIPF`) | Só de dia (refletância) |
+| `C07` a `C16` | 1 banda ABI (`CMIPF`) | Dia e noite (C07 tem reflexo solar de dia) |
+| `SPLIT_WINDOW` | C13, C15 | Dia e noite |
+| `AIRMASS` | C08, C10, C12, C13 | Dia e noite |
+| `DAY_CLOUD_PHASE` | C02, C05, C13 | Só de dia |
+| `NIGHT_MICROPHYSICS` | C07, C13, C15 | Feito pra noite |
+| `SEVERE_STORMS` | C02, C05, C07, C08, C10, C13 | Só de dia |
+| `OVERSHOOTING_TOPS` | C08, C12, C13 | Dia e noite |
+| `FIRE_TEMPERATURE` | C05, C06, C07 | Dia |
+| `GEOCOLOR` | C01, C02, C03, C13 | Dia e noite (transição pelo ângulo solar) |
+| `CLOUD_TOP_HEIGHT` | `ACHAF` | Dia e noite |
+| `CLOUD_BASE_HEIGHT`, `CLOUD_THICKNESS` | `ACHAF`, `CODF`, `ACTPF` | Dia e noite, mas é estimativa e à noite o COD só é confiável de 1 a 8 |
+| `GLM` | 1 arquivo GLM (20 s) + histórico se `POINTS` com `flash_age = True` + os arquivos do fundo escolhido | Dia e noite |
+
+---
+
+### Exemplos de renderização
 
 <p align="center">
-  <img src="assets/video.gif" alt="Animação GOES-16 Banda 13 Sem GLM" width="100%"><br>
-  <small><i>Animação GOES-16 Banda 13 Sem GLM (mostrado em GIF, logo qualidade reduzida)</i></small>
+  <img src="assets/animacao_ir.gif" alt="Animação em modo vídeo" width="100%"><br>
+  <small><i>Modo vídeo (C13, infravermelho)</i></small>
 </p>
-
-### Exemplos de Renderização
 
 <table border="0" width="100%">
   <tr>
-    <td align="center" width="33%">
-      <img src="assets/banda2_glm.png" alt="Banda 2 com GLM" width="100%"><br>
-      <small><i>Banda 2 (Visível) com GLM</i></small>
+    <td align="center" width="50%">
+      <img src="assets/geocolor.png" alt="GeoColor" width="100%"><br>
+      <small><i>GEOCOLOR (true-color de dia, IR à noite)</i></small>
     </td>
-    <td align="center" width="33%">
-      <img src="assets/banda7.png" alt="Banda 7 sem GLM" width="100%"><br>
-      <small><i>Banda 7 (IR Curto) sem GLM</i></small>
+    <td align="center" width="50%">
+      <img src="assets/airmass.png" alt="Airmass RGB" width="100%"><br>
+      <small><i>AIRMASS (composição RGB)</i></small>
     </td>
-    <td align="center" width="33%">
-      <img src="assets/banda9.png" alt="Banda 9 sem GLM" width="100%"><br>
-      <small><i>Banda 9 (Vapor d'água) sem GLM</i></small>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/severe_storms.png" alt="Severe Storms RGB" width="100%"><br>
+      <small><i>SEVERE_STORMS (composição RGB)</i></small>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/c02_glmpoints.png" alt="Banda 2 com GLM" width="100%"><br>
+      <small><i>C02 (visível) com GLM por cima</i></small>
     </td>
   </tr>
 </table>
@@ -49,88 +89,94 @@ pip install -r requirements.txt
 
 Pip puro também funciona, mas instalar o Cartopy vira um problema à parte dependendo do sistema operacional. Resolve GEOS/PROJ antes de rodar o `pip install`.
 
-O FFmpeg não precisa estar instalado nem no PATH: o `imageio-ffmpeg` (já vem no requirements) traz o próprio binário junto com o pacote. Roda em servidor sem tela sem precisar configurar nada, já que o `matplotlib.use("Agg")` fica forçado no topo dos módulos. Em servidor, use `open_video_when_done = False` no `config.ini` pra não tentar abrir o vídeo no fim.
+O FFmpeg não precisa estar instalado nem no PATH (`imageio-ffmpeg` traz o binário). Em servidor, use `open_video_when_done = False`. A primeira execução precisa de internet pro Cartopy baixar os dados de fronteiras/costa (Natural Earth); nas seguintes já está em cache local.
 
-A primeira execução precisa de internet pro mapa, pois o Cartopy baixa uma vez os dados de fronteiras, estados e costa (Natural Earth, escala 10m) e guarda no cache dele. O script faz esse download no processo principal, antes de disparar os workers. Nas execuções seguintes já está tudo local.
-
-Ajuste `config.ini` e `colors.ini` na raiz do projeto (canal, data/hora, coordenadas do recorte, cores, número de processos etc) e rode:
+Ajuste `config.ini` (produto, data/hora, coordenadas, performance) e `colors.ini` (paletas/receitas) na raiz do projeto e rode:
 
 ```bash
 python index.py
 ```
 
-Pode rodar de qualquer diretório: os dois `.ini` são lidos da pasta do script (não aceita caminho por parâmetro) e todas as pastas de saída e temporárias também ficam dentro da pasta do projeto. Valida tudo antes de baixar qualquer coisa, então se a execução morrer rápido é porque tem algo errado no `.ini`, e a mensagem diz o quê. No final imprime tempo de execução e avisos/erros no terminal, e no modo vídeo tenta abrir o resultado no player padrão do sistema (desligável em `open_video_when_done`).
+Roda de qualquer diretório: os dois `.ini` são lidos da pasta do script. Valida tudo antes de baixar qualquer coisa.
 
-## O que o projeto suporta (e o que não)
+## Arquitetura: como um produto vira uma imagem
 
-- Só ABI Full Disk (disco completo), produto `ABI-L2-CMIPF`, com uma imagem a cada 10 minutos, no modo de escaneamento 6. Períodos em que o satélite operava em outro modo (o GOES-16 só passou ao modo 6 por volta de abril de 2019) não são encontrados no bucket. CONUS e mesoescala não são suportados.
-- GLM (`GLM-L2-LCFA`): um arquivo a cada 20 segundos.
-- Troca automática de satélite: antes de 2025-04-07 15:10 UTC usa o GOES-16; a partir daí, o GOES-19. Esse horário é o da transição operacional divulgada pelo NWS, então frames muito próximos dele podem não existir (imagem única falha com erro claro, vídeo pula o frame).
-- Canais 1 a 6 (refletância) saem sempre em cinza; só os canais 7 a 16 e o GLM têm paleta editável em `colors.ini`.
+```
+config.ini [GENERAL] product = X
+        │
+        ▼
+products/registry.py    sabe quais arquivos X precisa do bucket da NOAA
+        │               (SourceSpec) e qual função sabe desenhá-lo (renderer)
+        ▼
+index.py                lista e baixa esses arquivos para o timestamp certo
+        │
+        ▼
+products/<módulo>.py    lê o(s) NetCDF e devolve um LayerResult padronizado
+   (abi / clavr)        (kind="mono": array 2D + colormap; kind="rgb":
+        │               array (H,W,3) já pronto)
+        ▼
+products/pipeline.py    desenha o LayerResult nos eixos do mapa, com
+                        colorbar, título e marca d'água quando aplicável,
+                        e salva o PNG
+```
 
-## Como funciona por dentro
+Módulos de `products/`: `core.py` (geometria da projeção, recorte, reamostragem, `LayerResult`), `abi.py` (leitura das bandas ABI, bandas individuais, SPLIT_WINDOW, composições RGB e GEOCOLOR), `clavr.py` (produtos de nuvem), `pipeline.py` (desenho comum), `registry.py` (mapa produto, fontes e renderer) e `glm.py` (relâmpagos).
 
-A validação de `config.ini`/`colors.ini` roda logo no início do `index.py`, antes de qualquer coisa tocar rede. Nessa etapa também é calculada a `render_signature`, um SHA1 de 12 caracteres com tudo que muda a aparência do frame: canal, `[MAP]`, `[STYLE]` inteiro, dpi, fundo do GLM e as paletas do canal ativo. Data e horário ficam de fora dessa assinatura de propósito.
+`products/glm.py` não passa por `pipeline.generate_standalone_image`: ele tem fluxo próprio (`GLM.generate_image`) porque desenha pontos/grade *por cima* de um fundo opcional. Esse fundo é resolvido pela mesma `pipeline.render_layer()` usada por qualquer outro produto, e é por isso que o GLM aceita qualquer coisa como fundo sem duplicar lógica de desenho.
 
-Essa assinatura define a pasta `satelite_temp_images/<assinatura>/` no modo vídeo. Mudar só o período reaproveita os frames já renderizados (desde que a pasta ainda exista: com `delete_temp_images = True` ela é apagada assim que o vídeo é montado, e só sobra se a execução for interrompida antes), mudar qualquer coisa visual gera uma pasta nova. No modo imagem única isso nem entra em jogo, a saída vai direto pra `satelite_images/`.
+Bandas ABI de resoluções nativas diferentes (0.5/1/2 km) aparecem juntas em várias composições RGB e no GEOCOLOR. `products/core.py::align_bands_to_reference` reamostra todas pra grade da banda mais grosseira da receita, por vizinho mais próximo em coordenadas de scan angle (não por índice de pixel), então o alinhamento geográfico se mantém mesmo com margens de recorte ligeiramente diferentes entre arquivos.
 
-A busca no S3 roda sequencial, fora dos processos de renderização: listagens do bucket por hora de dados (o s3fs reaproveita listagens já feitas na mesma execução), mais as da pasta ABI se `glm_background_band` estiver setado. Sem paralelismo aqui de propósito, listar já é rápido e paralelizar só aumenta a chance de bloqueio por parte da NOAA logo no começo.
+Adicionar um produto novo = 4 passos: (1) escrever um `render(nc_paths, config, colors_config, map_geo, product_spec, target_dt) -> LayerResult` num módulo de `products/`; (2) registrar em `products/registry.py::build_registry()` com suas `SourceSpec` (se o `kind` for novo, inclua também um ramo em `validate_product_colors` e, se ele puder ser fundo do GLM, em `_rebuild_cmap_for_background` de `products/glm.py`); (3) adicionar a seção de paleta/receita correspondente em `colors.ini`; (4) acrescentar o nome do produto na lista de valores aceitos nos comentários de `[GENERAL]` em `config.ini`. Não precisa tocar em `index.py` nem em `pipeline.py`.
 
-Antes de disparar os processos, o processo principal garante que os dados de mapa do Cartopy estejam em cache, pra que os workers não tentem baixar os mesmos arquivos ao mesmo tempo na primeira execução.
+## Limitações conhecidas (leia antes de usar em produção)
 
-A renderização distribui cada timestamp entre `num_workers` processos separados. Dentro de cada um:
+- GEOCOLOR é uma aproximação: true-color sintético de dia (o GOES não tem banda verde real, então o verde é uma combinação de C01/C02/C03) e IR realçado à noite, com transição pelo ângulo zenital solar calculado localmente. Não tem o mosaico de luzes noturnas nem o realce de neve/gelo do produto oficial do CIRA.
+- CLOUD_BASE_HEIGHT e CLOUD_THICKNESS são estimativas, não um produto público oficial (esse produto não existe no bucket da NOAA, e o que o CIRA/SLIDER mostra sai de um pipeline à parte). Aqui a espessura vem de uma parametrização simples em cima de `COD` (profundidade óptica, `ABI-L2-CODF`) e `Phase` (`ABI-L2-ACTPF`), com coeficientes editáveis em `colors.ini [ESTIMATE_CLOUD_GEOMETRY]`. Use só como visualização experimental.
+- As receitas das composições RGB (`RGB_AIRMASS`, `RGB_SEVERE_STORMS` etc. em `colors.ini`) seguem os quick guides públicos da NOAA/CIRA para o ABI e da EUMETSAT, com uma exceção: `OVERSHOOTING_TOPS` não tem guia publicado com esses números, é uma receita experimental inspirada no Tropical Airmass (detalhes em `colors.ini`). O `SEVERE_STORMS` segue a receita Severe Storms da EUMETSAT, com gama 0,5 no verde; o Day Convection da NOAA tem as mesmas faixas, mas gama 1 no verde. A gama segue a convenção EUMETSAT/CIRA, saída = valor ^ (1 / gama). Se notar diferença contra uma imagem de referência confiável, ajuste `min`/`max`/`gamma` sem mexer em código.
 
-- baixa o NetCDF principal (`S3_downloader.download_batch`, assíncrono, com validação do arquivo, retentativas e backoff). Cada worker baixa o próprio arquivo, então `num_workers` é também o número de downloads simultâneos do arquivo principal
-- renderiza com matplotlib/cartopy (`goes_bands.py` ou `GLM.py`)
+## Como funciona por dentro (detalhes de execução)
 
-No canal GLM o processo ainda busca o histórico de raios (`glm_history_lookback_steps` passos de 20s pra trás) numa segunda chamada assíncrona, com limite de concorrência próprio (`glm_history_max_concurrent_downloads`). As duas rodam em sequência, nunca ao mesmo tempo.
+A validação de `config.ini`/`colors.ini` roda logo no início do `index.py`, antes de qualquer coisa tocar rede. Nessa etapa também é calculada a `render_signature`, um SHA1 de 12 caracteres com tudo que muda a aparência do frame: produto, `[MAP]`, `[STYLE]` inteiro, dpi, e as seções de `colors.ini` relevantes pro produto ativo (incluindo, no caso do GLM, as do produto de fundo). Data e horário ficam de fora de propósito.
 
-Projeção, geometria da figura, título, marca d'água e as travas de arquivo ficam centralizados em `utils.py`. `goes_bands.py` e `GLM.py` só extraem a banda ou os raios e desenham.
+Essa assinatura define a pasta `satelite_temp_images/<assinatura>/` no modo vídeo. Mudar só o período reaproveita frames já renderizados; mudar qualquer coisa visual gera pasta nova.
 
-Depois que todos os processos terminam, o vídeo é montado à parte: lê os PNGs da pasta, valida cada um e manda pro FFmpeg via `imageio`.
+A busca no S3 roda sequencial, fora dos processos de renderização, uma listagem por hora de dados (e por fonte, quando o produto pede mais de um arquivo: RGBs, nuvem ou GLM com fundo). A renderização distribui cada timestamp entre `num_workers` processos separados; cada worker baixa os arquivos que o produto daquele frame precisa.
 
-## Detalhes que importam
+Fundo do GLM em modo vídeo: renderizado (não só baixado) uma única vez por bloco de 10 minutos e guardado em cache (`satelite_temp_downloads/glm_nc_cache/bg_*.npz`), reaproveitado pelos ~30 frames de 20s daquele bloco. A trava (`.lock`) tem limite de 5 min; se estourar, o frame sai sem fundo com aviso.
 
-- Todo o código sem exceção funciona no horário UTC.
-- Cache do fundo ABI no GLM só existe no modo vídeo, por bloco de 10 min, protegido por trava com limite de 5 min. Se a trava não liberar a tempo, o processo desiste e renderiza sem fundo, com aviso.
-- Cada arquivo do histórico do GLM tem a própria trava, e o download vai pra um arquivo temporário que só troca pelo definitivo quando termina. Se a trava passar de 5 min, o processo baixa mesmo assim, sem corromper nada. O download do histórico não tem nova tentativa: arquivo que falhar vira aviso no relatório final e aquele frame sai com a cauda incompleta.
-- O NetCDF do Full Disk é baixado inteiro, mesmo com recorte pequeno (o recorte só acontece na leitura). No ABI cada frame é um download novo, apagado assim que o frame fica pronto, então vídeo longo gera bastante tráfego.
-- Pixel sem dado (fora do disco ou falha do satélite) sai preto em qualquer canal, independente da paleta.
-- Arquivo ausente na NOAA é fatal em imagem única (não sobra nada pra renderizar) e vira só aviso em vídeo (só aquele frame fica de fora, o resto segue normal).
-- Só roda uma instância por pasta. Existe um `instance.lock` que bloqueia execuções simultâneas, porque duas instâncias iriam destruir os arquivos temporários uma da outra. Expira sozinho depois de 24h.
-- Todo PNG existente é validado com `PIL.Image.verify()` antes de entrar no vídeo, no início e de novo na montagem final. Frame inválido é apagado e re-renderizado, ou descartado se já tiver chegado nessa etapa. Frame com dimensão diferente do primeiro do lote é redimensionado (LANCZOS).
-- Os `.ini` são lidos em UTF-8, com `%` aceito nos valores (ex: no `watermark`). Comentário na mesma linha do valor não funciona: comente sempre em linha própria.
+Demais comportamentos de borda (satélite ausente no bucket, PNG corrompido, trava de instância única, limpeza de pastas temporárias) seguem exatamente como documentado nos comentários de `config.ini`.
 
 ## Pastas de saída
 
-Todas ficam dentro da pasta do projeto, independente de onde você rodou o comando.
-
 | Pasta | Conteúdo | Sobrevive entre execuções? |
 |---|---|---|
-| `satelite_images/` | PNGs do modo imagem única | Sim, nunca sobrescreve: nome repetido vira `nome (2).png`, `(3)`... |
-| `satelite_videos/` | MP4s do modo vídeo | Sim, mesmo esquema |
+| `satelite_images/` | PNGs do modo imagem única (`<PRODUTO>_<timestamp>.png`) | Sim, nunca sobrescreve |
+| `satelite_videos/` | MP4s do modo vídeo (`satelite_<PRODUTO>_<início>_a_<fim>.mp4`) | Sim |
 | `satelite_temp_images/<assinatura>/` | Frames do modo vídeo | Só se `delete_temp_images = False` |
-| `satelite_temp_downloads/` | NetCDF baixados na execução + cache do fundo ABI | Não, apaga tudo no final |
-| `satelite_temp_downloads/glm_nc_cache/` | NetCDF brutos do GLM reaproveitados na mesma execução | Não |
+| `satelite_temp_downloads/` | NetCDF baixados na execução | Não |
+| `satelite_temp_downloads/glm_nc_cache/` | Histórico do GLM + cache de fundo (`.npz`) | Não |
 | `satelite_temp_downloads/instance.lock` | Trava de execução única | Não, expira em 24h se sobrar |
 
 ## Solução de problemas comuns
 
 | Sintoma | O que fazer |
 |---|---|
-| Erro de validação logo no início | Leia a mensagem: ela aponta a chave do `.ini`. Confira formato do horário (ABI `HH:MM`, GLM `HH:MM:SS`), comentário na mesma linha do valor e chaves duplicadas. |
-| "Já existe outra execução deste script em andamento" | Outra instância está rodando. Se tiver certeza de que não há nenhuma (ex: o processo foi morto à força), apague `satelite_temp_downloads/instance.lock`. |
-| "Nenhum arquivo encontrado" / arquivo não encontrado no bucket | Confira data e hora em UTC, se os minutos são múltiplos de 10 (segundos múltiplos de 20 no GLM) e se o período é suportado (veja acima). A NOAA também tem lacunas ocasionais. |
-| Aviso de falha ao preparar dados de mapa | Na primeira execução é preciso ter internet para o Cartopy baixar o Natural Earth. Rode uma vez com internet. |
-| O processo morre sozinho no meio | Quase sempre falta de RAM. Reduza `num_workers`, `dpi` ou `figure_width`/`figure_height`. |
-| Vídeo GLM com frames "sem fundo" | Muitos workers disputando o mesmo fundo. Reduza `num_workers`. |
-| Vários avisos "Falha ao baixar o histórico GLM" | A NOAA está recusando ou atrasando requisições. Reduza `glm_history_max_concurrent_downloads` e `num_workers`. Os frames afetados saem com a cauda de raios incompleta. |
-| Servidor/cron sem tela | Use `open_video_when_done = False`. |
+| Erro de validação logo no início | Leia a mensagem: ela aponta a chave do `.ini`. Confira `product` contra a lista em `[GENERAL]`, formato do horário (`HH:MM` vs `HH:MM:SS` no GLM) e comentário na mesma linha do valor. |
+| "fonte(s) não encontrada(s) no bucket" | Um dos arquivos que o produto escolhido precisa (banda ABI ou `ACHAF`/`CODF`/`ACTPF`) não existe pra esse instante. Confira data/hora em UTC e se o período é suportado. |
+| "Já existe outra execução..." | Apague `satelite_temp_downloads/instance.lock` se tiver certeza de que não há execução ativa. |
+| GLM com fundo sempre "sem fundo" | Confira `[GLM] background` contra a lista de produtos válidos e se esse produto tem paleta/receita completa em `colors.ini`. |
+| Vídeo GLM com frames "sem fundo" às vezes | Muitos workers disputando o mesmo cache de fundo. Reduza `num_workers`. |
+| O processo morre sozinho no meio | Falta de RAM. Reduza `num_workers` primeiro (produtos com várias bandas/fontes pesam mais), depois `dpi`/`figure_width`/`figure_height`. |
+| Cores de uma composição RGB/GeoColor parecem erradas | Ajuste `min`/`max`/`gamma`/`invert` da seção `[RGB_*]` correspondente em `colors.ini`. São só números, não precisa mexer em código. Gama abaixo de 1 escurece, acima de 1 clareia. |
+| Erro de validação dizendo que a receita usa banda que o produto "não baixa" | Você trocou uma banda da receita por outra que o produto não baixa. Use uma das bandas listadas em `colors.ini` para aquele produto ou inclua a nova banda nas fontes dele em `products/registry.py`. |
+| Erro dizendo que `target_coordinates` está fora do disco visível | O recorte está numa região que o GOES-East não enxerga (ele cobre de uns -156 a 6 de longitude). Revise `[MAP] target_coordinates`. |
+| A imagem sai com horário diferente do esperado | Todos os horários do `config.ini` são UTC. Horário de Brasília é UTC-3, então 16:30 em Brasília é `19:30` no arquivo. |
 
 ## Créditos
 
 - Dados: satélites GOES-R da NOAA/NASA, via [NOAA Open Data Dissemination na AWS](https://registry.opendata.aws/noaa-goes/) (buckets `noaa-goes16` e `noaa-goes19`).
 - Mapas: [Natural Earth](https://www.naturalearthdata.com/), via Cartopy.
+- Receitas de RGB/GeoColor: quick guides públicos da EUMETSAT, CIMSS e CIRA (ver aviso de precisão em `colors.ini`).
 
 ## Licença
 

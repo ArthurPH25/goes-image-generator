@@ -8,7 +8,7 @@ import s3fs
 from botocore.exceptions import ClientError
 from netCDF4 import Dataset
 
-from utils import log_warning
+from utils import log_error, log_warning, GLM_PRODUCT
 
 CONNECT_TIMEOUT_S = 10
 READ_TIMEOUT_S = 30
@@ -18,16 +18,15 @@ MAX_RETRIES = 5
 BASE_BACKOFF_S = 1.5
 MAX_BACKOFF_S = 30.0
 
-ABI_PRODUCT = "ABI-L2-CMIPF"
-GLM_PRODUCT = "GLM-L2-LCFA"
+def build_hour_path(sat_bucket, dt, product_code):
+    return f"{sat_bucket}/{product_code}/{dt.year}/{dt.timetuple().tm_yday:03d}/{dt.hour:02d}/"
 
-def build_hour_path(sat_bucket, dt, is_glm):
-    product = GLM_PRODUCT if is_glm else ABI_PRODUCT
-    return f"{sat_bucket}/{product}/{dt.year}/{dt.timetuple().tm_yday:03d}/{dt.hour:02d}/"
 
-def build_file_prefix(dt, is_glm):
+def build_file_prefix(dt, product_code):
+    is_glm = product_code == GLM_PRODUCT
     prefix = f"s{dt.year:04d}{dt.timetuple().tm_yday:03d}{dt.hour:02d}{dt.minute:02d}"
     return f"{prefix}{dt.second:02d}" if is_glm else prefix
+
 
 def create_async_s3_fs():
     return s3fs.S3FileSystem(
@@ -40,6 +39,7 @@ def create_async_s3_fs():
         },
     )
 
+
 def _is_not_found_error(exc: Exception) -> bool:
     if isinstance(exc, FileNotFoundError):
         return True
@@ -47,11 +47,8 @@ def _is_not_found_error(exc: Exception) -> bool:
         error_code = exc.response.get("Error", {}).get("Code", "")
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         return error_code in ("404", "NoSuchKey", "NotFound") or status == 404
-    msg = str(exc).lower()
-    return "404" in msg or "no such key" in msg or "not found" in msg
+    return False
 
-def _is_permanent_local_error(exc: Exception) -> bool:
-    return isinstance(exc, (PermissionError, IsADirectoryError))
 
 def validate_nc_file(local_path: str, required_variables: list[str] | None = None) -> tuple[bool, str]:
     if not os.path.exists(local_path):
@@ -70,6 +67,7 @@ def validate_nc_file(local_path: str, required_variables: list[str] | None = Non
         return True, "ok"
     except Exception as e:
         return False, f"NetCDF corrompido ou ilegível: {e}"
+
 
 async def _download_one(
     fs: s3fs.S3FileSystem,
@@ -96,7 +94,7 @@ async def _download_one(
                     os.remove(local_path)
                 if _is_not_found_error(e):
                     return remote_path, False, f"arquivo não encontrado no bucket (404): {e}"
-                if _is_permanent_local_error(e):
+                if isinstance(e, (PermissionError, IsADirectoryError)):
                     return remote_path, False, f"erro local de permissão/caminho, sem nova tentativa: {e}"
                 last_error_msg = f"{type(e).__name__}: {e}"
             if attempt < max_retries:
@@ -106,6 +104,7 @@ async def _download_one(
                 log_warning(f"[{label}] Tentativa {attempt}/{max_retries} falhou ({last_error_msg}). Nova tentativa em {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
     return remote_path, False, f"esgotou {max_retries} tentativas -- último erro: {last_error_msg}"
+
 
 async def download_batch_async(
     downloads: list[dict],
@@ -138,9 +137,41 @@ async def download_batch_async(
         except Exception as e:
             log_warning(f"Falha ao fechar sessão S3 assíncrona: {e}")
 
+
 def download_batch(
     downloads: list[dict],
     max_concurrent: int = DEFAULT_MAX_CONCURRENT_DOWNLOADS,
     max_retries: int = MAX_RETRIES,
 ) -> dict[str, tuple[bool, str]]:
     return asyncio.run(download_batch_async(downloads, max_concurrent, max_retries))
+
+
+def download_sources(remote_paths, local_dir, name_prefix, label_prefix):
+    missing = [source_id for source_id, path in remote_paths.items() if not path]
+    if missing:
+        log_error(f"{label_prefix}: fonte(s) não encontrada(s) no bucket: {', '.join(missing)}.")
+        return None
+
+    os.makedirs(local_dir, exist_ok=True)
+    batch, local_paths = [], {}
+    for source_id, remote_path in remote_paths.items():
+        local_path = os.path.join(
+            local_dir, f"{name_prefix}{source_id}_{os.getpid()}_{os.path.basename(remote_path)}"
+        )
+        local_paths[source_id] = local_path
+        batch.append({
+            "remote_path": remote_path,
+            "local_path": local_path,
+            "label": f"{label_prefix} {source_id}",
+        })
+
+    results = download_batch(batch)
+    for item in batch:
+        ok, msg = results[item["remote_path"]]
+        if not ok:
+            log_error(f"{label_prefix}: falha ao baixar '{item['remote_path']}': {msg}")
+            for path in local_paths.values():
+                if os.path.exists(path):
+                    os.remove(path)
+            return None
+    return local_paths

@@ -1,11 +1,9 @@
-# Cache de bytecode do Python
-__pycache__/
+**/__pycache__/
+.vscode/
 
-# Script pessoal pra execução
-gerarImagensDeSatelite.sh
+goes-image-generator.sh
 
-# Pastas geradas pelo script
 satelite_images/
-satelite_videos/
-satelite_temp_images/
 satelite_temp_downloads/
+satelite_temp_images/
+satelite_videos/

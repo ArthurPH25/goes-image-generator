@@ -422,6 +422,11 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, colors_c
         reserve_right_frac=reserve_right_frac,
     )
 
+    transparent = glm_cfg["background"] is None
+    if transparent:
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
     try:
         if background_layer is not None:
             pipeline.draw_layer_on_axes(ax, geo_proj, style, background_layer)
@@ -436,19 +441,18 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, colors_c
         else:
             title_kind = _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_cfg, style)
 
-        if not style["clean_mode"]:
-            if glm_cfg["background"] and background_layer is not None:
-                title_text = (f"{sat_name} | GLM — {title_kind} | "
-                              f"{glm_cfg['background']} ({background_dt.strftime('%H:%M')} UTC) | "
-                              f"{target_dt.strftime('%d/%m/%Y')}")
-            else:
-                title_text = f"{sat_name} | GLM — {title_kind} | {target_dt.strftime('%d/%m/%Y')}"
-            pipeline.add_watermark_and_title(ax, title_ax, style, title_text)
+        if glm_cfg["background"] and background_layer is not None:
+            title_text = (f"{sat_name} | GLM — {title_kind} | "
+                          f"{glm_cfg['background']} ({background_dt.strftime('%H:%M')} UTC) | "
+                          f"{target_dt.strftime('%d/%m/%Y')}")
+        else:
+            title_text = f"{sat_name} | GLM — {title_kind} | {target_dt.strftime('%d/%m/%Y')}"
+        pipeline.add_watermark_and_title(ax, title_ax, style, title_text)
     except Exception:
         plt.close(fig)
         raise
 
-    pipeline.save_figure(fig, png_path, dpi)
+    pipeline.save_figure(fig, png_path, dpi, transparent=transparent)
 
 
 def _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_cfg, style):

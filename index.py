@@ -250,7 +250,7 @@ try:
         map_geo["target_coordinates"], core.GOES_EAST_SATELLITE_LON_DEG, core.GOES_EAST_SATELLITE_HEIGHT_M,
         core.GRS80_SEMI_MAJOR_AXIS_M, core.GRS80_SEMI_MINOR_AXIS_M,
     )
-    read_style_config(config)
+    style_cfg = read_style_config(config)
 
     glm_cfg = None
     if is_glm:
@@ -488,6 +488,14 @@ def process_satellite():
         print("=" * 70)
         print()
 
+        if gen_type == "V" and is_glm and not glm_cfg["background"]:
+            log_info(
+                "GLM sem fundo em vídeo: os frames PNG saem com fundo transparente, mas o MP4 não tem canal alpha "
+                "e mostra o fundo preto. Para ficar com a transparência, use generation_type = I ou mantenha os "
+                f"frames com delete_temp_images = False (pasta '{run_temp_dir}')."
+            )
+            print()
+
         S3_fs = s3fs.S3FileSystem(anon=True)
         tasks = []
 
@@ -544,9 +552,10 @@ def process_satellite():
         if not tasks:
             exit_fatal("Nenhum arquivo encontrado para as datas configuradas. Revise o 'config.ini'.")
 
-        print()
-        log_info("Verificando os dados de mapa do Cartopy...")
-        prefetch_map_features()
+        if not style_cfg["hide_map_lines"]:
+            print()
+            log_info("Verificando os dados de mapa do Cartopy...")
+            prefetch_map_features()
 
         log_info(f"Iniciando {num_workers} worker(s)...")
         print()
@@ -632,6 +641,9 @@ def process_satellite():
                                 img_object = Image.open(frame_path)
                                 if img_object.size != target_dimensions:
                                     img_object = img_object.resize(target_dimensions, Image.Resampling.LANCZOS)
+                                if img_object.mode == "RGBA":
+                                    black_bg = Image.new("RGBA", img_object.size, (0, 0, 0, 255))
+                                    img_object = Image.alpha_composite(black_bg, img_object).convert("RGB")
                                 video_writer.append_data(np.array(img_object))
                                 img_object.close()
 

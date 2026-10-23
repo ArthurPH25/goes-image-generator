@@ -121,6 +121,7 @@ def read_style_config(config):
         "watermark_color": watermark_color,
         "watermark_size": watermark_size,
         "clean_mode": config.getboolean("STYLE", "clean_mode"),
+        "hide_map_lines": config.getboolean("STYLE", "hide_map_lines"),
         "borders_color": borders_color,
         "borders_line_width": borders_line_width,
         "states_color": states_color,

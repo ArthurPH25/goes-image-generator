@@ -76,11 +76,14 @@ def create_map_axes(projection_type, sat_lon, sat_height, clean_mode, target_coo
     title_ax.set_facecolor("black")
 
     ax = fig.add_axes([0, 0, map_width_frac, map_frac_h], projection=map_proj)
+    ax.set_facecolor("black")
     ax.set_extent(target_coordinates, crs=ccrs.PlateCarree())
 
     return fig, ax, geo_proj, title_ax
 
 def add_geo_features(ax, style):
+    if style["hide_map_lines"]:
+        return
     ax.add_feature(cfeature.STATES.with_scale("10m"), linewidth=style["states_line_width"],
                     edgecolor=style["states_color"], alpha=0.7, zorder=2)
     ax.add_feature(cfeature.BORDERS.with_scale("10m"), linewidth=style["borders_line_width"],
@@ -126,8 +129,11 @@ def add_map_title(title_ax, text, fontsize_pt):
     patch = PathPatch(text_path, transform=transform, facecolor="white", edgecolor="none")
     title_ax.add_patch(patch)
 
-def save_figure(fig, png_path, dpi):
-    fig.savefig(png_path, facecolor="black", dpi=dpi)
+def save_figure(fig, png_path, dpi, transparent=False):
+    if transparent:
+        fig.savefig(png_path, transparent=True, dpi=dpi)
+    else:
+        fig.savefig(png_path, facecolor="black", dpi=dpi)
     fig.clf()
     plt.close(fig)
 
@@ -194,17 +200,16 @@ def generate_standalone_image(product_spec, nc_paths, sat_name, config, colors_c
     try:
         im = draw_layer_on_axes(ax, geo_proj, style, layer)
 
-        if not style["clean_mode"]:
-            if needs_colorbar:
-                cax = add_colorbar_axes(fig, ax)
-                colorbar = plt.colorbar(im, cax=cax, orientation="vertical", ticks=layer.colorbar_ticks)
-                unit = layer.colorbar_unit
-                colorbar.ax.set_yticklabels([f"{tick:g}{unit}" for tick in layer.colorbar_ticks],
-                                              color="white", size=10)
-                colorbar.outline.set_edgecolor("white")
+        if needs_colorbar:
+            cax = add_colorbar_axes(fig, ax)
+            colorbar = plt.colorbar(im, cax=cax, orientation="vertical", ticks=layer.colorbar_ticks)
+            unit = layer.colorbar_unit
+            colorbar.ax.set_yticklabels([f"{tick:g}{unit}" for tick in layer.colorbar_ticks],
+                                          color="white", size=10)
+            colorbar.outline.set_edgecolor("white")
 
-            title_text = f"{sat_name} | {layer.title_fragment} | {target_dt.strftime('%d/%m/%Y %H:%M')} UTC"
-            add_watermark_and_title(ax, title_ax, style, title_text)
+        title_text = f"{sat_name} | {layer.title_fragment} | {target_dt.strftime('%d/%m/%Y %H:%M')} UTC"
+        add_watermark_and_title(ax, title_ax, style, title_text)
     except Exception:
         plt.close(fig)
         raise

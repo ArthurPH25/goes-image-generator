@@ -16,7 +16,7 @@ Composições RGB: `AIRMASS`, `DAY_CLOUD_PHASE`, `NIGHT_MICROPHYSICS`, `SEVERE_S
 
 Produtos de nuvem: `CLOUD_TOP_HEIGHT` (produto oficial `ABI-L2-ACHAF`) e `CLOUD_BASE_HEIGHT`/`CLOUD_THICKNESS`, que são estimativas deste projeto (veja o aviso em `colors.ini` e "Limitações conhecidas" abaixo).
 
-GLM: `product = GLM`, configurado na seção `[GLM]` de `config.ini`. Dois modos (`render_mode`): `POINTS` (raios individuais, cor/tamanho por idade) e `DENSITY` (grade 2D de contagem de raios). Nos dois modos, `[GLM] background` aceita qualquer produto da lista acima como plano de fundo, inclusive outra composição RGB, o GEOCOLOR ou um produto de nuvem.
+GLM: `product = GLM`, configurado na seção `[GLM]` de `config.ini`. Dois modos (`render_mode`): `POINTS` (raios individuais, cor/tamanho por idade) e `DENSITY` (grade 2D de contagem de raios). Nos dois modos, `[GLM] background` aceita qualquer produto da lista acima como plano de fundo, inclusive outra composição RGB, o GEOCOLOR ou um produto de nuvem. Com `background` vazio o PNG sai com fundo transparente de verdade (canal alpha), em qualquer `render_mode`, com ou sem `clean_mode` e `hide_map_lines`. Em vídeo isso não se mantém: o MP4 não tem canal alpha e mostra o fundo preto. Para ter os frames transparentes, use `delete_temp_images = False` e pegue os PNGs em `satelite_temp_images/`.
 
 Só existem imagens ABI "Full Disk" (disco completo) a cada 10 minutos, modo de escaneamento 6 (GOES-16 só passou a esse modo em abril/2019; CONUS e mesoescala não são suportados). GLM (`GLM-L2-LCFA`) tem um arquivo a cada 20 segundos. Troca automática de satélite: antes de 2025-04-07 15:10 UTC usa o GOES-16; a partir daí, o GOES-19.
 
@@ -89,7 +89,7 @@ pip install -r requirements.txt
 
 Pip puro também funciona, mas instalar o Cartopy vira um problema à parte dependendo do sistema operacional. Resolve GEOS/PROJ antes de rodar o `pip install`.
 
-O FFmpeg não precisa estar instalado nem no PATH (`imageio-ffmpeg` traz o binário). Em servidor, use `open_video_when_done = False`. A primeira execução precisa de internet pro Cartopy baixar os dados de fronteiras/costa (Natural Earth); nas seguintes já está em cache local.
+O FFmpeg não precisa estar instalado nem no PATH (`imageio-ffmpeg` traz o binário). Em servidor, use `open_video_when_done = False`. A primeira execução precisa de internet pro Cartopy baixar os dados de fronteiras/costa (Natural Earth); nas seguintes já está em cache local. Com `hide_map_lines = True` esse download nem é feito.
 
 Ajuste `config.ini` (produto, data/hora, coordenadas, performance) e `colors.ini` (paletas/receitas) na raiz do projeto e rode:
 
@@ -116,7 +116,8 @@ products/<módulo>.py    lê o(s) NetCDF e devolve um LayerResult padronizado
         │               array (H,W,3) já pronto)
         ▼
 products/pipeline.py    desenha o LayerResult nos eixos do mapa, com
-                        colorbar, título e marca d'água quando aplicável,
+                        linhas, colorbar e título quando aplicável, e a
+                        marca d'água sempre que `watermark` não for vazio,
                         e salva o PNG
 ```
 
@@ -164,6 +165,7 @@ Demais comportamentos de borda (satélite ausente no bucket, PNG corrompido, tra
 | Erro de validação logo no início | Leia a mensagem: ela aponta a chave do `.ini`. Confira `product` contra a lista em `[GENERAL]`, formato do horário (`HH:MM` vs `HH:MM:SS` no GLM) e comentário na mesma linha do valor. |
 | "fonte(s) não encontrada(s) no bucket" | Um dos arquivos que o produto escolhido precisa (banda ABI ou `ACHAF`/`CODF`/`ACTPF`) não existe pra esse instante. Confira data/hora em UTC e se o período é suportado. |
 | "Já existe outra execução..." | Apague `satelite_temp_downloads/instance.lock` se tiver certeza de que não há execução ativa. |
+| GLM sem `background` sai com fundo preto no vídeo | É o MP4, que não tem transparência. Os frames PNG continuam transparentes: use `delete_temp_images = False` e pegue-os em `satelite_temp_images/<assinatura>/`. |
 | GLM com fundo sempre "sem fundo" | Confira `[GLM] background` contra a lista de produtos válidos e se esse produto tem paleta/receita completa em `colors.ini`. |
 | Vídeo GLM com frames "sem fundo" às vezes | Muitos workers disputando o mesmo cache de fundo. Reduza `num_workers`. |
 | O processo morre sozinho no meio | Falta de RAM. Reduza `num_workers` primeiro (produtos com várias bandas/fontes pesam mais), depois `dpi`/`figure_width`/`figure_height`. |

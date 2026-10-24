@@ -129,17 +129,17 @@ def add_map_title(title_ax, text, fontsize_pt):
     patch = PathPatch(text_path, transform=transform, facecolor="white", edgecolor="none")
     title_ax.add_patch(patch)
 
-def save_figure(fig, png_path, dpi, transparent=False):
+def save_figure(fig, image_path, dpi, transparent=False):
     if transparent:
-        fig.savefig(png_path, transparent=True, dpi=dpi)
+        fig.savefig(image_path, transparent=True, dpi=dpi)
     else:
-        fig.savefig(png_path, facecolor="black", dpi=dpi)
+        fig.savefig(image_path, facecolor="black", dpi=dpi)
     fig.clf()
     plt.close(fig)
 
 
 def add_watermark_and_title(ax, title_ax, style, title_text):
-    watermark = style["watermark"].strip()
+    watermark = style["watermark"].strip().replace("$", r"\$")
     if watermark:
         text = ax.text(0.98, 0.02, watermark, transform=ax.transAxes, color=style["watermark_color"],
                         fontsize=style["watermark_size"], fontweight="bold", ha="right", va="bottom", alpha=0.8)
@@ -152,16 +152,29 @@ COLORBAR_FRACTION = 0.03
 COLORBAR_PAD = 0.04
 COLORBAR_LABEL_RESERVE = 0.06
 COLORBAR_VERTICAL_MARGIN_FRAC = 0.02
-COLORBAR_RESERVE_RIGHT_FRAC = COLORBAR_FRACTION + COLORBAR_PAD + COLORBAR_LABEL_RESERVE
+COLORBAR_SLOT_FRAC = COLORBAR_FRACTION + COLORBAR_LABEL_RESERVE
 
 
-def add_colorbar_axes(fig, ax, fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD):
+def colorbar_reserve_frac(n_bars):
+    return COLORBAR_PAD + n_bars * COLORBAR_SLOT_FRAC if n_bars else 0.0
+
+
+def add_colorbar_axes(fig, ax, slot=0, fraction=COLORBAR_FRACTION, pad=COLORBAR_PAD):
     map_pos = ax.get_position()
     cbar_width = map_pos.width * fraction
     cbar_pad = map_pos.width * pad
+    slot_offset = map_pos.width * COLORBAR_SLOT_FRAC * slot
     cbar_y0 = map_pos.y0 + map_pos.height * COLORBAR_VERTICAL_MARGIN_FRAC
     cbar_height = map_pos.height * (1.0 - 2 * COLORBAR_VERTICAL_MARGIN_FRAC)
-    return fig.add_axes([map_pos.x1 + cbar_pad, cbar_y0, cbar_width, cbar_height])
+    return fig.add_axes([map_pos.x1 + cbar_pad + slot_offset, cbar_y0, cbar_width, cbar_height])
+
+
+def draw_colorbar(fig, ax, image, layer, slot=0):
+    cax = add_colorbar_axes(fig, ax, slot=slot)
+    colorbar = plt.colorbar(image, cax=cax, orientation="vertical", ticks=layer.colorbar_ticks)
+    colorbar.ax.set_yticklabels([f"{tick:g}{layer.colorbar_unit}" for tick in layer.colorbar_ticks],
+                                 color="white", size=10)
+    colorbar.outline.set_edgecolor("white")
 
 
 def render_layer(product_spec, nc_paths, config, colors_config, map_geo, target_dt):
@@ -179,7 +192,7 @@ def draw_layer_on_axes(ax, geo_proj, style, layer):
     return im
 
 
-def generate_standalone_image(product_spec, nc_paths, sat_name, config, colors_config, png_path, target_dt):
+def generate_standalone_image(product_spec, nc_paths, sat_name, config, colors_config, image_path, target_dt):
     dpi = config.getint("PROCESSING", "dpi")
     map_geo = read_map_geometry_config(config)
     style = read_style_config(config)
@@ -187,7 +200,7 @@ def generate_standalone_image(product_spec, nc_paths, sat_name, config, colors_c
     layer = render_layer(product_spec, nc_paths, config, colors_config, map_geo, target_dt)
 
     needs_colorbar = layer.kind == "mono" and layer.show_colorbar and not style["clean_mode"]
-    reserve_right_frac = COLORBAR_RESERVE_RIGHT_FRAC if needs_colorbar else 0.0
+    reserve_right_frac = colorbar_reserve_frac(1 if needs_colorbar else 0)
 
     figsize = (style["figure_width"], style["figure_height"])
     fig, ax, geo_proj, title_ax = create_map_axes(
@@ -201,12 +214,7 @@ def generate_standalone_image(product_spec, nc_paths, sat_name, config, colors_c
         im = draw_layer_on_axes(ax, geo_proj, style, layer)
 
         if needs_colorbar:
-            cax = add_colorbar_axes(fig, ax)
-            colorbar = plt.colorbar(im, cax=cax, orientation="vertical", ticks=layer.colorbar_ticks)
-            unit = layer.colorbar_unit
-            colorbar.ax.set_yticklabels([f"{tick:g}{unit}" for tick in layer.colorbar_ticks],
-                                          color="white", size=10)
-            colorbar.outline.set_edgecolor("white")
+            draw_colorbar(fig, ax, im, layer)
 
         title_text = f"{sat_name} | {layer.title_fragment} | {target_dt.strftime('%d/%m/%Y %H:%M')} UTC"
         add_watermark_and_title(ax, title_ax, style, title_text)
@@ -214,4 +222,4 @@ def generate_standalone_image(product_spec, nc_paths, sat_name, config, colors_c
         plt.close(fig)
         raise
 
-    save_figure(fig, png_path, dpi)
+    save_figure(fig, image_path, dpi)

@@ -97,6 +97,27 @@ def _lonlat_to_scan_angle(lon, lat, sat_lon, sat_height_total, req, rpol):
     return np.where(visible, x, np.nan), np.where(visible, y, np.nan)
 
 
+def scan_angle_to_lonlat(x_rad, y_rad, sat_lon_deg, sat_height_total, req, rpol):
+    x, y = np.meshgrid(x_rad, y_rad)
+    lam0 = np.radians(sat_lon_deg)
+
+    a = np.sin(x) ** 2 + (np.cos(x) ** 2) * (np.cos(y) ** 2 + ((req ** 2) / (rpol ** 2)) * np.sin(y) ** 2)
+    b = -2.0 * sat_height_total * np.cos(x) * np.cos(y)
+    c = sat_height_total ** 2 - req ** 2
+
+    discriminant = b ** 2 - 4 * a * c
+    discriminant = np.where(discriminant < 0, np.nan, discriminant)
+    r_s = (-b - np.sqrt(discriminant)) / (2 * a)
+
+    s_x = r_s * np.cos(x) * np.cos(y)
+    s_y = -r_s * np.sin(x)
+    s_z = r_s * np.cos(x) * np.sin(y)
+
+    lat = np.degrees(np.arctan(((req ** 2) / (rpol ** 2)) * (s_z / np.sqrt((sat_height_total - s_x) ** 2 + s_y ** 2))))
+    lon = np.degrees(lam0 - np.arctan(s_y / (sat_height_total - s_x)))
+    return lon, lat
+
+
 def visible_boundary_angles(target_coords, sat_lon, sat_height, req, rpol, edge_samples=25):
     lon_w, lon_e, lat_s, lat_n = target_coords
     edge_lons = np.linspace(lon_w, lon_e, edge_samples)

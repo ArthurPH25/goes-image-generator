@@ -34,6 +34,9 @@ def log_warning(message):
 def log_info(message):
     print(f"ℹ️ {message}")
 
+def log_success(message):
+    print(f"✅ {message}")
+
 def get_satellite_info(target_dt):
     if target_dt < GOES_TRANSITION_UTC:
         return "noaa-goes16", "GOES-16"

@@ -33,6 +33,7 @@ GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
 
 RENDER_MODES = ("POINTS", "DENSITY")
 KM_PER_DEGREE_LAT = 111.0
+BACKGROUND_COLORBAR_KINDS = ("thermal", "split_window", "cloud")
 
 
 def read_glm_config(config):
@@ -260,7 +261,7 @@ def _rebuild_cmap_for_background(background_key, colors_config):
     spec = registry.get_product(background_key)
     if spec.kind == "reflectance":
         return core.reflectance_cmap()
-    if spec.kind in ("thermal", "split_window", "cloud"):
+    if spec.kind in BACKGROUND_COLORBAR_KINDS:
         return core.build_colormap_from_section(colors_config, spec.palette_section)[0]
     raise ValueError(f"produto '{background_key}' (kind '{spec.kind}') não tem colormap definido para uso como fundo do GLM")
 
@@ -279,6 +280,7 @@ def save_background_layer(cache_data_path, layer):
         title_fragment=layer.title_fragment,
         vmin=np.nan if layer.vmin is None else layer.vmin,
         vmax=np.nan if layer.vmax is None else layer.vmax,
+        colorbar_ticks=np.asarray([] if layer.colorbar_ticks is None else layer.colorbar_ticks, dtype="float64"),
         colorbar_unit=layer.colorbar_unit,
         show_colorbar=layer.show_colorbar,
     )
@@ -300,6 +302,7 @@ def load_background_layer(cache_data_path, background_key, colors_config):
             title_fragment=str(npz["title_fragment"]),
             vmin=None if np.isnan(vmin_raw) else vmin_raw,
             vmax=None if np.isnan(vmax_raw) else vmax_raw,
+            colorbar_ticks=npz["colorbar_ticks"] if npz["colorbar_ticks"].size else None,
             colorbar_unit=str(npz["colorbar_unit"]),
             show_colorbar=bool(npz["show_colorbar"]),
         )
@@ -387,7 +390,7 @@ def resolve_background_layer(target_dt, glm_cfg, remote_background_files, config
         release_file_lock(lock_path)
 
 
-def generate_image(local_path, png_path, sat_name, pretty_time, config, colors_config, target_dt,
+def generate_image(local_path, image_path, sat_name, pretty_time, config, colors_config, target_dt,
                     remote_background_files, current_gen_type):
     dpi = config.getint("PROCESSING", "dpi")
     map_geo = read_map_geometry_config(config)
@@ -411,8 +414,14 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, colors_c
     else:
         axes_sat_h, axes_sat_lon, axes_sat_req, axes_sat_rpol = sat_h, sat_lon, sat_req, sat_rpol
 
+    background_key = glm_cfg["background"]
+    reserve_background_colorbar = (
+        background_key is not None
+        and registry.get_product(background_key).kind in BACKGROUND_COLORBAR_KINDS
+        and not style["clean_mode"]
+    )
     needs_density_colorbar = glm_cfg["render_mode"] == "DENSITY" and not style["clean_mode"]
-    reserve_right_frac = pipeline.COLORBAR_RESERVE_RIGHT_FRAC if needs_density_colorbar else 0.0
+    reserve_right_frac = pipeline.colorbar_reserve_frac(int(reserve_background_colorbar) + int(needs_density_colorbar))
 
     figsize = (style["figure_width"], style["figure_height"])
     fig, ax, geo_proj, title_ax = pipeline.create_map_axes(
@@ -429,14 +438,17 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, colors_c
 
     try:
         if background_layer is not None:
-            pipeline.draw_layer_on_axes(ax, geo_proj, style, background_layer)
+            background_image = pipeline.draw_layer_on_axes(ax, geo_proj, style, background_layer)
+            if reserve_background_colorbar and background_layer.show_colorbar:
+                pipeline.draw_colorbar(fig, ax, background_image, background_layer)
         else:
             pipeline.add_geo_features(ax, style)
             if glm_cfg["background"]:
                 log_warning(f"Prosseguindo sem o fundo {glm_cfg['background']} neste frame ({pretty_time}).")
 
         if glm_cfg["render_mode"] == "DENSITY":
-            flash_count = _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, style)
+            flash_count = _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, style,
+                                        colorbar_slot=int(reserve_background_colorbar))
             title_kind = f"Densidade de Raios, {flash_count} raios ({target_dt.strftime('%H:%M:%S')} UTC)"
         else:
             title_kind = _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_cfg, style)
@@ -452,7 +464,7 @@ def generate_image(local_path, png_path, sat_name, pretty_time, config, colors_c
         plt.close(fig)
         raise
 
-    pipeline.save_figure(fig, png_path, dpi, transparent=transparent)
+    pipeline.save_figure(fig, image_path, dpi, transparent=transparent)
 
 
 def _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_cfg, style):
@@ -514,7 +526,7 @@ def _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_c
     return f"{len(all_lons)} raios ({target_dt.strftime('%H:%M:%S')} UTC)"
 
 
-def _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, style):
+def _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, style, colorbar_slot):
     resolution_km = glm_cfg["density_grid_resolution_km"]
     lon_edges, lat_edges, counts = compute_density_grid(
         all_lons, all_lats, map_geo["target_coordinates"], resolution_km
@@ -527,7 +539,7 @@ def _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, 
     )
 
     if not style["clean_mode"]:
-        cax = pipeline.add_colorbar_axes(fig, ax)
+        cax = pipeline.add_colorbar_axes(fig, ax, slot=colorbar_slot)
         tick_step = max(1, round((vmax - vmin) / 6))
         ticks = np.arange(vmin, vmax + 1, tick_step)
         colorbar = plt.colorbar(mesh, cax=cax, orientation="vertical", ticks=ticks)

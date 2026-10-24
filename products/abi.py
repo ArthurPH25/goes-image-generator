@@ -200,27 +200,6 @@ def render_rgb(nc_paths, config, colors_config, map_geo, product_spec, target_dt
     )
 
 
-def scan_angle_to_lonlat(x_rad, y_rad, sat_lon_deg, sat_height_total, req, rpol):
-    x, y = np.meshgrid(x_rad, y_rad)
-    lam0 = np.radians(sat_lon_deg)
-
-    a = np.sin(x) ** 2 + (np.cos(x) ** 2) * (np.cos(y) ** 2 + ((req ** 2) / (rpol ** 2)) * np.sin(y) ** 2)
-    b = -2.0 * sat_height_total * np.cos(x) * np.cos(y)
-    c = sat_height_total ** 2 - req ** 2
-
-    discriminant = b ** 2 - 4 * a * c
-    discriminant = np.where(discriminant < 0, np.nan, discriminant)
-    r_s = (-b - np.sqrt(discriminant)) / (2 * a)
-
-    s_x = r_s * np.cos(x) * np.cos(y)
-    s_y = -r_s * np.sin(x)
-    s_z = r_s * np.cos(x) * np.sin(y)
-
-    lat = np.degrees(np.arctan(((req ** 2) / (rpol ** 2)) * (s_z / np.sqrt((sat_height_total - s_x) ** 2 + s_y ** 2))))
-    lon = np.degrees(lam0 - np.arctan(s_y / (sat_height_total - s_x)))
-    return lon, lat
-
-
 def solar_zenith_angle_deg(lat_deg, lon_deg, dt_utc):
     day_of_year = dt_utc.timetuple().tm_yday
     hour_utc = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
@@ -310,7 +289,7 @@ def render_geocolor(nc_paths, config, colors_config, map_geo, product_spec, targ
     night_gray = apply_gamma(np.nan_to_num(1.0 - night_norm, nan=0.0), cfg["night_gamma"])
     night_rgb = np.dstack([night_gray, night_gray, night_gray])
 
-    lon_grid, lat_grid = scan_angle_to_lonlat(
+    lon_grid, lat_grid = core.scan_angle_to_lonlat(
         reference["x_rad"], reference["y_rad"], reference["sat_lon"],
         reference["sat_h"] + reference["sat_req"], reference["sat_req"], reference["sat_rpol"],
     )

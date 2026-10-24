@@ -4,6 +4,7 @@ s3fs
 botocore
 matplotlib>=3.5
 cartopy
+scipy
 Pillow>=9.1
 imageio
 imageio-ffmpeg

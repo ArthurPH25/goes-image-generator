@@ -23,6 +23,7 @@ if sys.platform == "win32":
 
 import cartopy.feature as cfeature
 import cartopy.io.shapereader as shpreader
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from PIL import Image
 import imageio.v2 as imageio
 import numpy as np
@@ -35,6 +36,7 @@ from utils import (
     log_error,
     log_warning,
     log_info,
+    log_success,
     acquire_file_lock,
     release_file_lock,
     LOG_COLLECTOR_STATE,
@@ -60,10 +62,6 @@ def configure_log_collector(shared_list):
 def exit_fatal(message):
     print(f"☠️ ERRO FATAL: {message}")
     sys.exit(1)
-
-
-def log_success(message):
-    print(f"✅ {message}")
 
 
 def format_elapsed_time(seconds):
@@ -174,6 +172,9 @@ def compute_render_signature(config, colors_config, product_key, dpi):
     return hashlib.sha1(payload_json.encode("utf-8")).hexdigest()[:12]
 
 
+SUPPORTED_IMAGE_FORMATS = {"png": ".png", "webp": ".webp", "jpg": ".jpg", "jpeg": ".jpg", "tiff": ".tiff", "tif": ".tiff"}
+SUPPORTED_IMAGE_FORMATS_ALPHA = {"png": True, "webp": True, "jpg": False, "jpeg": False, "tiff": True, "tif": True}
+
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
 COLORS_PATH = os.path.join(BASE_DIR, "colors.ini")
 
@@ -207,13 +208,28 @@ try:
     is_glm = product_key == "GLM"
 
     gen_type = config.get("GENERAL", "generation_type").strip().upper()
-    if gen_type not in ["I", "V"]:
-        exit_fatal(f"generation_type '{gen_type}' inválido. Os valores válidos são 'I' ou 'V'.")
+    if gen_type not in ["I", "V", "S"]:
+        exit_fatal(
+            f"generation_type '{gen_type}' inválido. Os valores válidos são "
+            "'I' (imagem única), 'V' (vídeo) ou 'S' (sequência de imagens)."
+        )
 
     num_workers = _get_positive_int(config, "PROCESSING", "num_workers")
     delete_temp = config.getboolean("PROCESSING", "delete_temp_images")
     open_video = config.getboolean("PROCESSING", "open_video_when_done")
     dpi = _get_positive_int(config, "PROCESSING", "dpi")
+
+    image_format = config.get("PROCESSING", "image_format").strip().lower()
+    if image_format not in SUPPORTED_IMAGE_FORMATS:
+        raise ValueError(
+            f"image_format '{image_format}' inválido. Valores aceitos: {sorted(SUPPORTED_IMAGE_FORMATS)}"
+        )
+    image_ext = SUPPORTED_IMAGE_FORMATS[image_format]
+    if image_ext.lstrip(".") not in FigureCanvasAgg.get_supported_filetypes():
+        raise ValueError(
+            f"image_format '{image_format}' não é suportado pelo matplotlib/Pillow instalados neste ambiente. "
+            "Atualize com: pip install -U matplotlib Pillow"
+        )
 
     if is_glm:
         _get_positive_int(config, "PROCESSING", "glm_history_lookback_steps")
@@ -255,12 +271,18 @@ try:
     glm_cfg = None
     if is_glm:
         glm_cfg = GLM.validate_glm_config(config, colors_config)
+        if (gen_type in ("I", "S") and not glm_cfg["background"]
+                and not SUPPORTED_IMAGE_FORMATS_ALPHA[image_format]):
+            raise ValueError(
+                f"image_format '{image_format}' não tem canal alpha, mas [GLM] background está vazio "
+                "(fundo transparente). Use png, webp ou tiff, ou defina um background."
+            )
     else:
         registry.validate_product_colors(product_key, colors_config)
 
     render_signature = compute_render_signature(config, colors_config, product_key, dpi)
     run_temp_dir = os.path.join(TEMP_IMAGES_DIR, render_signature)
-    output_dir = IMAGES_DIR if gen_type == "I" else run_temp_dir
+    output_dir = IMAGES_DIR if gen_type in ("I", "S") else run_temp_dir
 
     target_dates = []
 
@@ -278,25 +300,31 @@ try:
 
         target_dates.append(target_dt)
     else:
-        start_date_str = config.get("VIDEO_TIME", "start_date")
-        start_time_str = config.get("VIDEO_TIME", "start_time")
-        end_date_str = config.get("VIDEO_TIME", "end_date")
-        end_time_str = config.get("VIDEO_TIME", "end_time")
-        video_fps = _get_positive_int(config, "VIDEO_TIME", "fps")
+        if not config.has_section("TIME_RANGE") and config.has_section("VIDEO_TIME"):
+            raise ValueError(
+                "a seção [VIDEO_TIME] do config.ini foi renomeada para [TIME_RANGE] "
+                "(ela vale para vídeo e para sequência de imagens). Troque só o nome da seção, "
+                "as chaves dentro dela continuam as mesmas."
+            )
+        start_date_str = config.get("TIME_RANGE", "start_date")
+        start_time_str = config.get("TIME_RANGE", "start_time")
+        end_date_str = config.get("TIME_RANGE", "end_date")
+        end_time_str = config.get("TIME_RANGE", "end_time")
+        video_fps = _get_positive_int(config, "TIME_RANGE", "fps") if gen_type == "V" else None
 
         start_dt = parse_datetime(start_date_str, start_time_str, require_seconds=is_glm)
         end_dt = parse_datetime(end_date_str, end_time_str, require_seconds=is_glm)
 
         if is_glm:
             if start_dt.second % GLM_STEP_SECONDS != 0 or end_dt.second % GLM_STEP_SECONDS != 0:
-                raise ValueError("Início e fim do vídeo GLM exigem segundos múltiplos de 20 (00, 20 ou 40).")
+                raise ValueError("Início e fim do período GLM exigem segundos múltiplos de 20 (00, 20 ou 40).")
         else:
             if start_dt.minute % ABI_STEP_MINUTES != 0 or end_dt.minute % ABI_STEP_MINUTES != 0:
-                raise ValueError("Início e fim do vídeo exigem minutos múltiplos de 10.")
+                raise ValueError("Início e fim do período exigem minutos múltiplos de 10.")
 
         if end_dt <= start_dt:
             raise ValueError(
-                "O período do vídeo é inválido: end_date/end_time "
+                "O período é inválido: end_date/end_time "
                 f"({end_dt.strftime('%Y-%m-%d %H:%M:%S')}) deve ser posterior a "
                 f"start_date/start_time ({start_dt.strftime('%Y-%m-%d %H:%M:%S')})."
             )
@@ -315,11 +343,22 @@ except Exception as e:
     )
 
 
-def build_png_name(product_key, pretty_time):
-    return f"{product_key}_{pretty_time}.png"
+def build_image_name(product_key, pretty_time, ext):
+    return f"{product_key}_{pretty_time}{ext}"
 
 
-def _is_valid_png(path):
+def build_sequence_image_name(product_key, target_dt, ext):
+    stamp = target_dt.strftime("%Y%m%d_%H%M%S") if is_glm else target_dt.strftime("%Y%m%d_%H%M")
+    return f"{product_key}_{stamp}{ext}"
+
+
+def build_sequence_dir_path(first_dt, last_dt):
+    stamp_fmt = "%Y%m%d_%H%M%S" if is_glm else "%Y%m%d_%H%M"
+    folder_name = f"{product_key}_{first_dt.strftime(stamp_fmt)}_a_{last_dt.strftime(stamp_fmt)}"
+    return get_unique_path(os.path.join(IMAGES_DIR, folder_name))
+
+
+def _is_valid_image(path):
     try:
         with Image.open(path) as img:
             img.verify()
@@ -347,19 +386,23 @@ def process_file_worker(task):
     sat_name = task["sat_name"]
 
     pretty_time = target_dt.strftime("%Y%j%H%M%S") if is_glm else target_dt.strftime("%Y%j%H%M")
-    log_time = pretty_time
-    png_name = build_png_name(product_key, pretty_time)
-    png_path = os.path.join(output_path, png_name)
+    log_time = target_dt.strftime("%Y-%m-%d %H:%M:%S") if is_glm else target_dt.strftime("%Y-%m-%d %H:%M")
+    frame_ext = ".png" if current_gen_type == "V" else image_ext
+    if current_gen_type == "S":
+        image_name = build_sequence_image_name(product_key, target_dt, frame_ext)
+    else:
+        image_name = build_image_name(product_key, pretty_time, frame_ext)
+    image_path = os.path.join(output_path, image_name)
 
     if current_gen_type == "I":
-        png_path = get_unique_path(png_path)
+        image_path = get_unique_path(image_path)
 
-    if current_gen_type == "V" and os.path.exists(png_path):
-        if _is_valid_png(png_path):
+    if current_gen_type == "V" and os.path.exists(image_path):
+        if _is_valid_image(image_path):
             log_info(f"[{log_time} UTC] Frame já existe no cache. Pulando.")
             return True
         log_warning(f"[{log_time} UTC] Frame em cache estava corrompido (execução anterior interrompida?). Regenerando.")
-        os.remove(png_path)
+        os.remove(image_path)
 
     local_paths = None
     try:
@@ -398,24 +441,24 @@ def process_file_worker(task):
                     if got_glm_lock:
                         release_file_lock(glm_cache_lock_path)
 
-            log_info(f"[{log_time} UTC] Processando dados e salvando PNG.")
+            log_info(f"[{log_time} UTC] Processando dados e salvando a imagem.")
             GLM.generate_image(
-                cache_path, png_path, sat_name, pretty_time, config, colors_config,
+                cache_path, image_path, sat_name, log_time, config, colors_config,
                 target_dt=target_dt, remote_background_files=task["background_remote_paths"],
-                current_gen_type=current_gen_type,
+                current_gen_type="I" if current_gen_type == "I" else "V",
             )
         else:
             local_paths = download_sources(task["main_remote_paths"], TEMP_NC_DIR, "temp_", f"[{log_time} UTC] principal")
             if local_paths is None:
                 raise Exception("Falha ao baixar um ou mais arquivos principais deste produto.")
 
-            log_info(f"[{log_time} UTC] Processando dados e salvando PNG.")
+            log_info(f"[{log_time} UTC] Processando dados e salvando a imagem.")
             pipeline.generate_standalone_image(
-                product_spec, local_paths, sat_name, config, colors_config, png_path, target_dt
+                product_spec, local_paths, sat_name, config, colors_config, image_path, target_dt
             )
 
-        if not os.path.exists(png_path):
-            raise Exception("O módulo do produto não gerou o PNG esperado (falha silenciosa).")
+        if not os.path.exists(image_path):
+            raise Exception("O módulo do produto não gerou a imagem esperada (falha silenciosa).")
 
         gc.collect()
         log_success(f"[{log_time} UTC] Frame concluído.")
@@ -467,6 +510,10 @@ def process_satellite():
                 "tiver certeza de que não há nenhuma rodando, apague o arquivo de lock manualmente."
             )
 
+        frames_dir = output_dir
+        if gen_type == "S":
+            frames_dir = build_sequence_dir_path(target_dates[0], target_dates[-1])
+
         if is_glm and glm_cfg["background"]:
             product_label = f"GLM (fundo {glm_cfg['background']}, {glm_cfg['render_mode']})"
         elif is_glm:
@@ -476,10 +523,13 @@ def process_satellite():
 
         print("=" * 70)
         print("🛰️ GERADOR DE IMAGENS DE SATÉLITE 🛰️")
-        print(f"Modo: {'Vídeo' if gen_type == 'V' else 'Imagem Única'} | Produto Ativo: {product_label}")
+        mode_label = {"I": "Imagem Única", "V": "Vídeo", "S": "Sequência de Imagens"}[gen_type]
+        print(f"Modo: {mode_label} | Produto Ativo: {product_label}")
         print(f"Alvo: {config.get('MAP', 'target_coordinates')}")
         if gen_type == "V":
             print(f"Pasta de frames desta execução: {run_temp_dir}")
+        elif gen_type == "S":
+            print(f"Pasta de saída das imagens: {frames_dir}")
         time_fmt = "%d/%m/%Y %H:%M:%S" if is_glm else "%d/%m/%Y %H:%M"
         if gen_type == "I":
             print(f"Instante: {target_dates[0].strftime(time_fmt)} UTC")
@@ -504,6 +554,7 @@ def process_satellite():
         t_start_search = time.time()
 
         background_spec = None
+        background_search_cache = {}
         if is_glm and glm_cfg["background"]:
             background_spec = registry.get_product(glm_cfg["background"])
 
@@ -523,15 +574,23 @@ def process_satellite():
             background_remote_paths = {}
             if background_spec is not None:
                 background_dt = floor_to_abi_step(target)
-                bg_sat_bucket, _ = get_satellite_info(background_dt)
-                for source in background_spec.sources:
-                    found = _find_source_file(S3_fs, bg_sat_bucket, background_dt, source)
-                    background_remote_paths[source.source_id] = found
-                if not all(background_remote_paths.values()):
-                    log_warning(
-                        f"Fundo {glm_cfg['background']} das {background_dt.strftime('%H:%M')} UTC incompleto no "
-                        "bucket; frame sairá sem fundo."
-                    )
+                if background_dt not in background_search_cache:
+                    bg_sat_bucket, _ = get_satellite_info(background_dt)
+                    bg_found = {}
+                    for source in background_spec.sources:
+                        bg_found[source.source_id] = _find_source_file(S3_fs, bg_sat_bucket, background_dt, source)
+                    background_search_cache[background_dt] = bg_found
+                    if all(bg_found.values()):
+                        log_success(
+                            f"Encontrado: {background_dt.strftime('%H:%M')} UTC "
+                            f"({', '.join(bg_found)}, fundo do GLM)"
+                        )
+                    else:
+                        log_warning(
+                            f"Fundo {glm_cfg['background']} das {background_dt.strftime('%H:%M')} UTC incompleto no "
+                            "bucket; os frames GLM deste bloco de 10 minutos sairão sem fundo."
+                        )
+                background_remote_paths = background_search_cache[background_dt]
 
             if not all_found:
                 missing = [s.source_id for s in sources if not main_remote_paths[s.source_id]]
@@ -543,7 +602,7 @@ def process_satellite():
                 "main_remote_paths": main_remote_paths,
                 "background_remote_paths": background_remote_paths,
                 "sat_name": sat_name,
-                "output_path": output_dir,
+                "output_path": frames_dir,
                 "current_gen_type": gen_type,
             })
             log_success(f"Encontrado: {target.strftime('%H:%M:%S')} UTC ({', '.join(main_remote_paths)})")
@@ -551,6 +610,16 @@ def process_satellite():
 
         if not tasks:
             exit_fatal("Nenhum arquivo encontrado para as datas configuradas. Revise o 'config.ini'.")
+
+        print()
+        search_summary = f"Busca concluída: {len(tasks)} de {len(target_dates)} instante(s) encontrado(s)"
+        if background_spec is not None:
+            bg_ok = sum(1 for found in background_search_cache.values() if all(found.values()))
+            search_summary += f" e {bg_ok} de {len(background_search_cache)} fundo(s) {glm_cfg['background']}"
+        log_info(f"{search_summary}.")
+
+        if gen_type == "S":
+            os.makedirs(frames_dir, exist_ok=True)
 
         if not style_cfg["hide_map_lines"]:
             print()
@@ -602,10 +671,10 @@ def process_satellite():
                     for task in tasks:
                         target_dt = datetime.fromtimestamp(task["target_ts"], tz=timezone.utc)
                         pretty_time = target_dt.strftime("%Y%j%H%M%S") if is_glm else target_dt.strftime("%Y%j%H%M")
-                        frame_path = os.path.join(output_dir, build_png_name(product_key, pretty_time))
+                        frame_path = os.path.join(output_dir, build_image_name(product_key, pretty_time, ".png"))
                         if not os.path.exists(frame_path):
                             continue
-                        if _is_valid_png(frame_path):
+                        if _is_valid_image(frame_path):
                             video_frames.append(frame_path)
                         else:
                             skipped_corrupt += 1
@@ -677,6 +746,15 @@ def process_satellite():
                     t_end_video = time.time()
             else:
                 exit_fatal("O modo configurado é de vídeo, mas nenhuma imagem foi gerada. Não é possível montar o vídeo.")
+        elif gen_type == "S":
+            if success_count > 0:
+                log_success(f"Sequência pronta: {success_count} imagem(ns) salva(s) em: {frames_dir}")
+            else:
+                try:
+                    os.rmdir(frames_dir)
+                except OSError:
+                    pass
+                exit_fatal("O modo configurado é de sequência de imagens, mas nenhuma imagem foi gerada.")
         elif success_count == 0:
             exit_fatal("A imagem não foi gerada. Revise os erros acima.")
 
@@ -694,10 +772,11 @@ def process_satellite():
         print("RELATÓRIO DE TEMPO DE EXECUÇÃO")
         print("=" * 70)
 
-        if gen_type == "V":
+        if gen_type in ("V", "S"):
             print(f"Tempo buscando arquivos na NOAA: {calc_time(t_start_search, t_end_search)}")
             print(f"Tempo baixando e gerando as imagens: {calc_time(t_start_images, t_end_images)}")
-            print(f"Tempo montando o vídeo: {calc_time(t_start_video, t_end_video)}")
+            if gen_type == "V":
+                print(f"Tempo montando o vídeo: {calc_time(t_start_video, t_end_video)}")
             print("-" * 70)
 
         print(f"TEMPO TOTAL DE EXECUÇÃO: {calc_time(t_start_total, t_end_total)}")

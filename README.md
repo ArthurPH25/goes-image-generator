@@ -1,6 +1,6 @@
 # GOES Image Generator
 
-Gera imagens e vídeos a partir dos satélites GOES-16/GOES-19, focado na América do Sul. Baixa os NetCDF direto do bucket público da NOAA na AWS (acesso anônimo, sem credenciais), recorta a região configurada, aplica as paletas/receitas de `colors.ini` e renderiza com matplotlib/cartopy. Dá pra gerar uma imagem única ou montar um vídeo com FFmpeg.
+Gera imagens e vídeos a partir dos satélites GOES-16/GOES-19, focado na América do Sul. Baixa os NetCDF direto do bucket público da NOAA na AWS (acesso anônimo, sem credenciais), recorta a região configurada, aplica as paletas/receitas de `colors.ini` e renderiza com matplotlib/cartopy. Dá pra gerar uma imagem única, montar um vídeo com FFmpeg ou só uma sequência de imagens de um período, sem vídeo. O formato das imagens exportadas (png, webp, jpg ou tiff) é escolhido em `image_format`.
 
 Toda a configuração (produto, período, mapa, cores, performance) fica em `config.ini` e `colors.ini`, com explicações sobre todos os parâmetros. Esse README cobre o que os `.ini` não explicam: a arquitetura por trás de `product =`.
 
@@ -16,7 +16,7 @@ Composições RGB: `AIRMASS`, `DAY_CLOUD_PHASE`, `NIGHT_MICROPHYSICS`, `SEVERE_S
 
 Produtos de nuvem: `CLOUD_TOP_HEIGHT` (produto oficial `ABI-L2-ACHAF`) e `CLOUD_BASE_HEIGHT`/`CLOUD_THICKNESS`, que são estimativas deste projeto (veja o aviso em `colors.ini` e "Limitações conhecidas" abaixo).
 
-GLM: `product = GLM`, configurado na seção `[GLM]` de `config.ini`. Dois modos (`render_mode`): `POINTS` (raios individuais, cor/tamanho por idade) e `DENSITY` (grade 2D de contagem de raios). Nos dois modos, `[GLM] background` aceita qualquer produto da lista acima como plano de fundo, inclusive outra composição RGB, o GEOCOLOR ou um produto de nuvem. Com `background` vazio o PNG sai com fundo transparente de verdade (canal alpha), em qualquer `render_mode`, com ou sem `clean_mode` e `hide_map_lines`. Em vídeo isso não se mantém: o MP4 não tem canal alpha e mostra o fundo preto. Para ter os frames transparentes, use `delete_temp_images = False` e pegue os PNGs em `satelite_temp_images/`.
+GLM: `product = GLM`, configurado na seção `[GLM]` de `config.ini`. Dois modos (`render_mode`): `POINTS` (raios individuais, cor/tamanho por idade) e `DENSITY` (grade 2D de contagem de raios). Nos dois modos, `[GLM] background` aceita qualquer produto da lista acima como plano de fundo, inclusive outra composição RGB, o GEOCOLOR ou um produto de nuvem. Quando o fundo tem barra de cores (bandas térmicas, SPLIT_WINDOW e produtos de nuvem), ela sai à direita do mapa. Com `background` vazio o PNG sai com fundo transparente de verdade (canal alpha), em qualquer `render_mode`, com ou sem `clean_mode` e `hide_map_lines`. Em vídeo isso não se mantém: o MP4 não tem canal alpha e mostra o fundo preto. Para ter os frames transparentes, use `generation_type = S` (sequência de imagens, PNGs direto em `satelite_images/`) ou `generation_type = I`.
 
 Só existem imagens ABI "Full Disk" (disco completo) a cada 10 minutos, modo de escaneamento 6 (GOES-16 só passou a esse modo em abril/2019; CONUS e mesoescala não são suportados). GLM (`GLM-L2-LCFA`) tem um arquivo a cada 20 segundos. Troca automática de satélite: antes de 2025-04-07 15:10 UTC usa o GOES-16; a partir daí, o GOES-19.
 
@@ -118,7 +118,7 @@ products/<módulo>.py    lê o(s) NetCDF e devolve um LayerResult padronizado
 products/pipeline.py    desenha o LayerResult nos eixos do mapa, com
                         linhas, colorbar e título quando aplicável, e a
                         marca d'água sempre que `watermark` não for vazio,
-                        e salva o PNG
+                        e salva a imagem no formato de image_format
 ```
 
 Módulos de `products/`: `core.py` (geometria da projeção, recorte, reamostragem, `LayerResult`), `abi.py` (leitura das bandas ABI, bandas individuais, SPLIT_WINDOW, composições RGB e GEOCOLOR), `clavr.py` (produtos de nuvem), `pipeline.py` (desenho comum), `registry.py` (mapa produto, fontes e renderer) e `glm.py` (relâmpagos).
@@ -143,7 +143,7 @@ Essa assinatura define a pasta `satelite_temp_images/<assinatura>/` no modo víd
 
 A busca no S3 roda sequencial, fora dos processos de renderização, uma listagem por hora de dados (e por fonte, quando o produto pede mais de um arquivo: RGBs, nuvem ou GLM com fundo). A renderização distribui cada timestamp entre `num_workers` processos separados; cada worker baixa os arquivos que o produto daquele frame precisa.
 
-Fundo do GLM em modo vídeo: renderizado (não só baixado) uma única vez por bloco de 10 minutos e guardado em cache (`satelite_temp_downloads/glm_nc_cache/bg_*.npz`), reaproveitado pelos ~30 frames de 20s daquele bloco. A trava (`.lock`) tem limite de 5 min; se estourar, o frame sai sem fundo com aviso.
+Fundo do GLM em modo vídeo ou sequência de imagens: renderizado (não só baixado) uma única vez por bloco de 10 minutos e guardado em cache (`satelite_temp_downloads/glm_nc_cache/bg_*.npz`), reaproveitado pelos ~30 frames de 20s daquele bloco. A trava (`.lock`) tem limite de 5 min; se estourar, o frame sai sem fundo com aviso.
 
 Demais comportamentos de borda (satélite ausente no bucket, PNG corrompido, trava de instância única, limpeza de pastas temporárias) seguem exatamente como documentado nos comentários de `config.ini`.
 
@@ -151,9 +151,10 @@ Demais comportamentos de borda (satélite ausente no bucket, PNG corrompido, tra
 
 | Pasta | Conteúdo | Sobrevive entre execuções? |
 |---|---|---|
-| `satelite_images/` | PNGs do modo imagem única (`<PRODUTO>_<timestamp>.png`) | Sim, nunca sobrescreve |
+| `satelite_images/` | Imagens do modo imagem única (`<PRODUTO>_<timestamp>.<ext>`, ext conforme `image_format`) | Sim, nunca sobrescreve |
+| `satelite_images/<PRODUTO>_<início>_a_<fim>/` | Imagens do modo sequência (`<PRODUTO>_<AAAAMMDD>_<HHMM>.<ext>`, GLM com segundos) | Sim, cada execução cria uma pasta nova |
 | `satelite_videos/` | MP4s do modo vídeo (`satelite_<PRODUTO>_<início>_a_<fim>.mp4`) | Sim |
-| `satelite_temp_images/<assinatura>/` | Frames do modo vídeo | Só se `delete_temp_images = False` |
+| `satelite_temp_images/<assinatura>/` | Frames do modo vídeo (sempre PNG) | Só se `delete_temp_images = False` |
 | `satelite_temp_downloads/` | NetCDF baixados na execução | Não |
 | `satelite_temp_downloads/glm_nc_cache/` | Histórico do GLM + cache de fundo (`.npz`) | Não |
 | `satelite_temp_downloads/instance.lock` | Trava de execução única | Não, expira em 24h se sobrar |
@@ -165,7 +166,7 @@ Demais comportamentos de borda (satélite ausente no bucket, PNG corrompido, tra
 | Erro de validação logo no início | Leia a mensagem: ela aponta a chave do `.ini`. Confira `product` contra a lista em `[GENERAL]`, formato do horário (`HH:MM` vs `HH:MM:SS` no GLM) e comentário na mesma linha do valor. |
 | "fonte(s) não encontrada(s) no bucket" | Um dos arquivos que o produto escolhido precisa (banda ABI ou `ACHAF`/`CODF`/`ACTPF`) não existe pra esse instante. Confira data/hora em UTC e se o período é suportado. |
 | "Já existe outra execução..." | Apague `satelite_temp_downloads/instance.lock` se tiver certeza de que não há execução ativa. |
-| GLM sem `background` sai com fundo preto no vídeo | É o MP4, que não tem transparência. Os frames PNG continuam transparentes: use `delete_temp_images = False` e pegue-os em `satelite_temp_images/<assinatura>/`. |
+| GLM sem `background` sai com fundo preto no vídeo | É o MP4, que não tem transparência. Os PNGs continuam transparentes: use `generation_type = S` para recebê-los direto em `satelite_images/<PRODUTO>_.../`. |
 | GLM com fundo sempre "sem fundo" | Confira `[GLM] background` contra a lista de produtos válidos e se esse produto tem paleta/receita completa em `colors.ini`. |
 | Vídeo GLM com frames "sem fundo" às vezes | Muitos workers disputando o mesmo cache de fundo. Reduza `num_workers`. |
 | O processo morre sozinho no meio | Falta de RAM. Reduza `num_workers` primeiro (produtos com várias bandas/fontes pesam mais), depois `dpi`/`figure_width`/`figure_height`. |

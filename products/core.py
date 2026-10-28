@@ -6,25 +6,25 @@ import matplotlib.colors as mcolors
 import numpy as np
 
 REFLECTANCE_BANDS = {
-    1: ("Visível Azul", "0,47"),
-    2: ("Visível Vermelho", "0,64"),
-    3: ("Próximo ao Infravermelho - Vegetação", "0,86"),
-    4: ("Próximo ao Infravermelho - Cirrus", "1,37"),
-    5: ("Próximo ao Infravermelho - Neve/Gelo", "1,61"),
-    6: ("Próximo ao Infravermelho - Tamanho de Partícula de Nuvem", "2,24"),
+    1: ("Visible Blue", "0.47"),
+    2: ("Visible Red", "0.64"),
+    3: ("Near-Infrared - Vegetation", "0.86"),
+    4: ("Near-Infrared - Cirrus", "1.37"),
+    5: ("Near-Infrared - Snow/Ice", "1.61"),
+    6: ("Near-Infrared - Cloud Particle Size", "2.24"),
 }
 
 THERMAL_BANDS = {
-    7: ("Infravermelho de Onda Curta", "3,90", 20),
-    8: ("Vapor d'água de Altos Níveis", "6,19", 10),
-    9: ("Vapor d'água de Médios Níveis", "6,95", 10),
-    10: ("Vapor d'água de Baixos Níveis", "7,34", 10),
-    11: ("Infravermelho - Fase de Topo de Nuvem", "8,44", 10),
-    12: ("Infravermelho - Ozônio", "9,61", 10),
-    13: ("Infravermelho Térmico - Janela Limpa", "10,33", 10),
-    14: ("Infravermelho Térmico - Janela Principal", "11,19", 10),
-    15: ("Infravermelho Térmico - Janela Suja", "12,27", 10),
-    16: ("Infravermelho - Dióxido de Carbono", "13,27", 10),
+    7: ("Shortwave Infrared", "3.90", 20),
+    8: ("Upper-Level Water Vapor", "6.19", 10),
+    9: ("Mid-Level Water Vapor", "6.95", 10),
+    10: ("Lower-Level Water Vapor", "7.34", 10),
+    11: ("Infrared - Cloud-Top Phase", "8.44", 10),
+    12: ("Infrared - Ozone", "9.61", 10),
+    13: ("Thermal Infrared - Clean Window", "10.33", 10),
+    14: ("Thermal Infrared - Main Window", "11.19", 10),
+    15: ("Thermal Infrared - Dirty Window", "12.27", 10),
+    16: ("Infrared - Carbon Dioxide", "13.27", 10),
 }
 
 NO_DATA_COLOR = "black"
@@ -132,8 +132,8 @@ def visible_boundary_angles(target_coords, sat_lon, sat_height, req, rpol, edge_
     valid = np.isfinite(xs) & np.isfinite(ys)
     if not valid.any():
         raise ValueError(
-            f"target_coordinates {target_coords} fora do disco visível pelo satélite "
-            "(o GOES-East enxerga aproximadamente de -156 a 6 de longitude). Revise [MAP] em config.ini."
+            f"target_coordinates {target_coords} is outside the disk visible from the satellite "
+            "(GOES-East sees roughly longitudes -156 to 6). Review [MAP] in config.ini."
         )
     return xs[valid], ys[valid]
 

@@ -52,21 +52,21 @@ def _is_not_found_error(exc: Exception) -> bool:
 
 def validate_nc_file(local_path: str, required_variables: list[str] | None = None) -> tuple[bool, str]:
     if not os.path.exists(local_path):
-        return False, "arquivo não existe em disco após o download"
+        return False, "file does not exist on disk after download"
     file_size = os.path.getsize(local_path)
     if file_size < MIN_VALID_FILE_SIZE_BYTES:
-        return False, f"arquivo suspeito de estar truncado/vazio ({file_size} bytes)"
+        return False, f"file looks truncated/empty ({file_size} bytes)"
     try:
         with Dataset(local_path, "r") as ds:
             if required_variables:
                 missing = [v for v in required_variables if v not in ds.variables]
                 if missing:
-                    return False, f"variáveis ausentes no NetCDF: {missing}"
+                    return False, f"variables missing from the NetCDF: {missing}"
                 for var_name in required_variables:
                     _ = ds.variables[var_name][:1]
         return True, "ok"
     except Exception as e:
-        return False, f"NetCDF corrompido ou ilegível: {e}"
+        return False, f"corrupted or unreadable NetCDF: {e}"
 
 
 async def _download_one(
@@ -78,7 +78,7 @@ async def _download_one(
     max_retries: int,
     label: str,
 ) -> tuple[str, bool, str]:
-    last_error_msg = "motivo desconhecido"
+    last_error_msg = "unknown reason"
     async with semaphore:
         for attempt in range(1, max_retries + 1):
             try:
@@ -93,17 +93,17 @@ async def _download_one(
                 if os.path.exists(local_path):
                     os.remove(local_path)
                 if _is_not_found_error(e):
-                    return remote_path, False, f"arquivo não encontrado no bucket (404): {e}"
+                    return remote_path, False, f"file not found in the bucket (404): {e}"
                 if isinstance(e, (PermissionError, IsADirectoryError)):
-                    return remote_path, False, f"erro local de permissão/caminho, sem nova tentativa: {e}"
+                    return remote_path, False, f"local permission/path error, not retrying: {e}"
                 last_error_msg = f"{type(e).__name__}: {e}"
             if attempt < max_retries:
                 backoff = min(BASE_BACKOFF_S * (2 ** (attempt - 1)), MAX_BACKOFF_S)
                 jitter = random.uniform(0, backoff * 0.5)
                 wait_time = backoff + jitter
-                log_warning(f"[{label}] Tentativa {attempt}/{max_retries} falhou ({last_error_msg}). Nova tentativa em {wait_time:.1f}s...")
+                log_warning(f"[{label}] Attempt {attempt}/{max_retries} failed ({last_error_msg}). Retrying in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
-    return remote_path, False, f"esgotou {max_retries} tentativas -- último erro: {last_error_msg}"
+    return remote_path, False, f"exhausted {max_retries} attempts -- last error: {last_error_msg}"
 
 
 async def download_batch_async(
@@ -135,7 +135,7 @@ async def download_batch_async(
         try:
             await session.close()
         except Exception as e:
-            log_warning(f"Falha ao fechar sessão S3 assíncrona: {e}")
+            log_warning(f"Failed to close the async S3 session: {e}")
 
 
 def download_batch(
@@ -149,10 +149,9 @@ def download_batch(
 def download_sources(remote_paths, local_dir, name_prefix, label_prefix):
     missing = [source_id for source_id, path in remote_paths.items() if not path]
     if missing:
-        log_error(f"{label_prefix}: fonte(s) não encontrada(s) no bucket: {', '.join(missing)}.")
+        log_error(f"{label_prefix}: source(s) not found in the bucket: {', '.join(missing)}.")
         return None
 
-    os.makedirs(local_dir, exist_ok=True)
     batch, local_paths = [], {}
     for source_id, remote_path in remote_paths.items():
         local_path = os.path.join(
@@ -169,7 +168,7 @@ def download_sources(remote_paths, local_dir, name_prefix, label_prefix):
     for item in batch:
         ok, msg = results[item["remote_path"]]
         if not ok:
-            log_error(f"{label_prefix}: falha ao baixar '{item['remote_path']}': {msg}")
+            log_error(f"{label_prefix}: failed to download '{item['remote_path']}': {msg}")
             for path in local_paths.values():
                 if os.path.exists(path):
                     os.remove(path)

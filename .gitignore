@@ -3,7 +3,5 @@
 
 goes-image-generator.sh
 
-satelite_images/
-satelite_temp_downloads/
-satelite_temp_images/
-satelite_videos/
+output/
+temp/

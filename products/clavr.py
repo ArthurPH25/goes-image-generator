@@ -16,9 +16,9 @@ def _read_scalar_grid(local_path, variable_name, map_geo):
     try:
         if variable_name not in nc.variables:
             raise ValueError(
-                f"variável '{variable_name}' não encontrada em '{local_path}'. "
-                "Confira se o produto baixado é mesmo o esperado (ACHAF/CODF/ACTPF) "
-                "e se a NOAA não renomeou a variável numa versão mais nova do produto."
+                f"variable '{variable_name}' not found in '{local_path}'. "
+                "Check that the downloaded product is the expected one (ACHAF/CODF/ACTPF) "
+                "and that NOAA did not rename the variable in a newer version of the product."
             )
         sat_h, sat_lon, sat_req, sat_rpol = core.get_projection_params(nc)
         row_slice, col_slice = core.get_crop_slices(nc, map_geo["target_coordinates"])
@@ -46,7 +46,7 @@ def read_estimate_config(colors_config, section="ESTIMATE_CLOUD_GEOMETRY"):
         "base_height_floor_m": colors_config.getfloat(section, "base_height_floor_m"),
     }
     if cfg["max_thickness_m"] <= cfg["min_thickness_m"]:
-        raise ValueError(f"[{section}] max_thickness_m deve ser maior que min_thickness_m")
+        raise ValueError(f"[{section}] max_thickness_m must be greater than min_thickness_m")
     return cfg
 
 
@@ -92,17 +92,17 @@ def _mono_meters_layer(reference, data, title_fragment, colors_config, palette_s
 
 def render_cloud_top_height(nc_paths, config, colors_config, map_geo, product_spec, target_dt):
     layer = _read_scalar_grid(nc_paths["ACHAF"], CLOUD_TOP_HEIGHT_VAR, map_geo)
-    return _mono_meters_layer(layer, layer["data"], "Altura do Topo da Nuvem (ABI-L2-ACHAF)",
+    return _mono_meters_layer(layer, layer["data"], "Cloud Top Height (ABI-L2-ACHAF)",
                               colors_config, product_spec.palette_section, 9)
 
 
 def render_cloud_base_height(nc_paths, config, colors_config, map_geo, product_spec, target_dt):
     reference, _thickness, base = _estimate_top_and_thickness(nc_paths, colors_config, map_geo)
-    return _mono_meters_layer(reference, base, "Altura da Base da Nuvem (estimativa)",
+    return _mono_meters_layer(reference, base, "Cloud Base Height (estimate)",
                               colors_config, product_spec.palette_section, 8)
 
 
 def render_cloud_thickness(nc_paths, config, colors_config, map_geo, product_spec, target_dt):
     reference, thickness, _base = _estimate_top_and_thickness(nc_paths, colors_config, map_geo)
-    return _mono_meters_layer(reference, thickness, "Espessura Geométrica da Nuvem (estimativa)",
+    return _mono_meters_layer(reference, thickness, "Cloud Geometric Thickness (estimate)",
                               colors_config, product_spec.palette_section, 8)

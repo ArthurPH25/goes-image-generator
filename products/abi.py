@@ -113,17 +113,17 @@ def render_split_window(nc_paths, config, colors_config, map_geo, product_spec, 
 def _parse_band_key(raw, section, key_name):
     raw = raw.strip().upper()
     if not (raw.startswith("C") and raw[1:].isdigit()):
-        raise ValueError(f"[{section}] {key_name} inválido: '{raw}' (formato esperado: C01-C16)")
+        raise ValueError(f"[{section}] invalid {key_name}: '{raw}' (expected format: C01-C16)")
     band_id = int(raw[1:])
     if band_id not in core.REFLECTANCE_BANDS and band_id not in core.THERMAL_BANDS:
-        raise ValueError(f"[{section}] {key_name} inválido: banda C{band_id:02d} não existe (use C01-C16)")
+        raise ValueError(f"[{section}] invalid {key_name}: band C{band_id:02d} does not exist (use C01-C16)")
     return band_id
 
 
 def read_channel_spec(colors_config, section, channel):
     mode = colors_config.get(section, f"{channel}_mode").strip().lower()
     if mode not in VALID_MODES:
-        raise ValueError(f"[{section}] {channel}_mode deve ser 'single' ou 'difference', recebido '{mode}'")
+        raise ValueError(f"[{section}] {channel}_mode must be 'single' or 'difference', got '{mode}'")
 
     spec = {"mode": mode}
     if mode == "single":
@@ -140,9 +140,9 @@ def read_channel_spec(colors_config, section, channel):
     spec["invert"] = colors_config.getboolean(section, f"{channel}_invert")
 
     if spec["max"] <= spec["min"]:
-        raise ValueError(f"[{section}] {channel}_max deve ser maior que {channel}_min")
+        raise ValueError(f"[{section}] {channel}_max must be greater than {channel}_min")
     if spec["gamma"] <= 0:
-        raise ValueError(f"[{section}] {channel}_gamma deve ser positivo")
+        raise ValueError(f"[{section}] {channel}_gamma must be positive")
 
     return spec
 
@@ -237,7 +237,7 @@ def read_geocolor_config(colors_config, section="RGB_GEOCOLOR"):
     day_b_band = _parse_band_key(colors_config.get(section, "day_b_band"), section, "day_b_band")
     weights = [float(w.strip()) for w in colors_config.get(section, "green_synth_weights").split(",")]
     if len(weights) != 3:
-        raise ValueError(f"[{section}] green_synth_weights precisa de exatamente 3 números (C02, C03, C01)")
+        raise ValueError(f"[{section}] green_synth_weights needs exactly 3 numbers (C02, C03, C01)")
     night_band = _parse_band_key(colors_config.get(section, "night_band"), section, "night_band")
 
     cfg = {
@@ -257,11 +257,11 @@ def read_geocolor_config(colors_config, section="RGB_GEOCOLOR"):
     }
     for prefix in ("day_r", "day_b", "night"):
         if cfg[f"{prefix}_max"] <= cfg[f"{prefix}_min"]:
-            raise ValueError(f"[{section}] {prefix}_max deve ser maior que {prefix}_min")
+            raise ValueError(f"[{section}] {prefix}_max must be greater than {prefix}_min")
     if cfg["night_gamma"] <= 0:
-        raise ValueError(f"[{section}] night_gamma deve ser positivo")
+        raise ValueError(f"[{section}] night_gamma must be positive")
     if cfg["twilight_zenith_end"] <= cfg["twilight_zenith_start"]:
-        raise ValueError(f"[{section}] twilight_zenith_end deve ser maior que twilight_zenith_start")
+        raise ValueError(f"[{section}] twilight_zenith_end must be greater than twilight_zenith_start")
     return cfg
 
 

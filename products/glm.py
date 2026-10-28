@@ -21,14 +21,13 @@ from utils import (
     log_info,
     acquire_file_lock,
     release_file_lock,
-    TEMP_NC_DIR,
+    TEMP_DIR,
     GLM_PRODUCT,
     GLM_STEP_SECONDS,
     floor_to_abi_step,
 )
 from S3_downloader import download_sources, create_async_s3_fs, build_hour_path, build_file_prefix
 
-GLM_NC_CACHE_DIR = os.path.join(TEMP_NC_DIR, "glm_nc_cache")
 GLM_REQUIRED_VARS = ["flash_lon", "flash_lat"]
 
 RENDER_MODES = ("POINTS", "DENSITY")
@@ -40,28 +39,28 @@ def read_glm_config(config):
     section = "GLM"
     render_mode = config.get(section, "render_mode").strip().upper()
     if render_mode not in RENDER_MODES:
-        raise ValueError(f"[{section}] render_mode deve ser POINTS ou DENSITY, recebido '{render_mode}'")
+        raise ValueError(f"[{section}] render_mode must be POINTS or DENSITY, got '{render_mode}'")
 
     flash_age = config.getboolean(section, "flash_age")
 
     density_grid_resolution_km = config.getfloat(section, "density_grid_resolution_km")
     if density_grid_resolution_km <= 0:
-        raise ValueError(f"[{section}] density_grid_resolution_km deve ser positivo")
+        raise ValueError(f"[{section}] density_grid_resolution_km must be positive")
 
     background_raw = config.get(section, "background").strip().upper()
     background = background_raw or None
     if background is not None:
         if not registry.is_valid_product_key(background):
-            raise ValueError(f"[{section}] background '{background_raw}' não é um produto válido")
+            raise ValueError(f"[{section}] background '{background_raw}' is not a valid product")
         if background == "GLM":
-            raise ValueError(f"[{section}] background não pode ser 'GLM' (GLM não pode ser fundo de si mesmo)")
+            raise ValueError(f"[{section}] background cannot be 'GLM' (GLM cannot be its own background)")
 
     flash_marker_min = config.getfloat(section, "flash_marker_min")
     flash_marker_max = config.getfloat(section, "flash_marker_max")
     if flash_marker_min <= 0 or flash_marker_max <= 0:
-        raise ValueError(f"[{section}] flash_marker_min e flash_marker_max devem ser positivos")
+        raise ValueError(f"[{section}] flash_marker_min and flash_marker_max must be positive")
     if flash_marker_min > flash_marker_max:
-        raise ValueError(f"[{section}] flash_marker_min não pode ser maior que flash_marker_max")
+        raise ValueError(f"[{section}] flash_marker_min cannot be greater than flash_marker_max")
 
     return {
         "render_mode": render_mode,
@@ -79,10 +78,10 @@ def validate_glm_config(config, colors_config):
     if glm_cfg["render_mode"] == "POINTS":
         section = "PALETTE_GLM"
         if not colors_config.has_section(section):
-            raise ValueError(f"seção '[{section}]' ausente em colors.ini, obrigatória com [GLM] render_mode = POINTS")
+            raise ValueError(f"section '[{section}]' missing from colors.ini, required with [GLM] render_mode = POINTS")
         if not colors_config.has_option(section, "default"):
-            raise ValueError(f"chave 'default' ausente na seção '[{section}]'")
-        validate_color(f"[{section}] chave default", colors_config.get(section, "default"))
+            raise ValueError(f"key 'default' missing from section '[{section}]'")
+        validate_color(f"[{section}] key default", colors_config.get(section, "default"))
 
         numeric_items = []
         for key, value in colors_config.items(section):
@@ -90,17 +89,17 @@ def validate_glm_config(config, colors_config):
                 continue
             if not key.isdigit():
                 raise ValueError(
-                    f"chave '{key}' na seção '[{section}]' inválida: use 'default' ou uma idade "
-                    "inteira em segundos (ex: 150)"
+                    f"invalid key '{key}' in section '[{section}]': use 'default' or an integer "
+                    "age in seconds (e.g. 150)"
                 )
             numeric_items.append((key, value))
 
         if glm_cfg["flash_age"] and not numeric_items:
             raise ValueError(
-                f"[GLM] flash_age = True exige ao menos uma chave numérica de idade em [{section}]"
+                f"[GLM] flash_age = True requires at least one numeric age key in [{section}]"
             )
         for key, value in numeric_items:
-            validate_color(f"[{section}] chave {key}", value)
+            validate_color(f"[{section}] key {key}", value)
     else:
         registry.validate_palette_section(colors_config, "PALETTE_GLM_DENSITY")
 
@@ -178,7 +177,7 @@ async def _list_and_download_history(target_dt, sat_bucket, cache_dir, max_lookb
             except FileNotFoundError:
                 return bucket_path, []
             except Exception as e:
-                log_warning(f"Falha ao listar {bucket_path} no histórico do GLM: {e}")
+                log_warning(f"Failed to list {bucket_path} in the GLM history: {e}")
                 return bucket_path, []
 
         listings = dict(await asyncio.gather(*(list_hour(path) for path in sorted({step[1] for step in steps}))))
@@ -205,8 +204,8 @@ async def _list_and_download_history(target_dt, sat_bucket, cache_dir, max_lookb
                         return age_seconds, cache_path
                     if not got_lock:
                         log_warning(
-                            f"Timeout esperando lock do histórico GLM ({os.path.basename(remote_path)}); "
-                            "tentando baixar mesmo assim."
+                            f"Timed out waiting for the GLM history lock ({os.path.basename(remote_path)}); "
+                            "downloading anyway."
                         )
                     tmp_download_path = f"{cache_path}.part_{os.getpid()}"
                     try:
@@ -220,8 +219,8 @@ async def _list_and_download_history(target_dt, sat_bucket, cache_dir, max_lookb
                             except OSError:
                                 pass
                         log_warning(
-                            f"Falha ao baixar o histórico GLM {os.path.basename(remote_path)}: {e}. "
-                            "O frame sai com a cauda incompleta."
+                            f"Failed to download GLM history file {os.path.basename(remote_path)}: {e}. "
+                            "The frame will have an incomplete tail."
                         )
                         return None
                 finally:
@@ -235,11 +234,10 @@ async def _list_and_download_history(target_dt, sat_bucket, cache_dir, max_lookb
         try:
             await session.close()
         except Exception as e:
-            log_warning(f"Falha ao fechar sessão S3 do histórico GLM: {e}")
+            log_warning(f"Failed to close the S3 session for the GLM history: {e}")
 
 
 def _fetch_flash_history(target_dt, sat_bucket, cache_dir, max_lookback_steps, max_concurrent_history):
-    os.makedirs(cache_dir, exist_ok=True)
     history_files = asyncio.run(
         _list_and_download_history(target_dt, sat_bucket, cache_dir, max_lookback_steps, max_concurrent_history)
     )
@@ -252,7 +250,7 @@ def _fetch_flash_history(target_dt, sat_bucket, cache_dir, max_lookback_steps, m
                     lats = list(nc_past.variables["flash_lat"][:])
                     parsed.append((age_seconds, lons, lats))
         except Exception as e:
-            log_warning(f"Arquivo de histórico GLM ilegível ({os.path.basename(local_path)}): {e}")
+            log_warning(f"Unreadable GLM history file ({os.path.basename(local_path)}): {e}")
             continue
     return parsed
 
@@ -263,7 +261,7 @@ def _rebuild_cmap_for_background(background_key, colors_config):
         return core.reflectance_cmap()
     if spec.kind in BACKGROUND_COLORBAR_KINDS:
         return core.build_colormap_from_section(colors_config, spec.palette_section)[0]
-    raise ValueError(f"produto '{background_key}' (kind '{spec.kind}') não tem colormap definido para uso como fundo do GLM")
+    raise ValueError(f"product '{background_key}' (kind '{spec.kind}') has no colormap defined for use as a GLM background")
 
 
 def save_background_layer(cache_data_path, layer):
@@ -322,14 +320,14 @@ def resolve_background_layer(target_dt, glm_cfg, remote_background_files, config
     def _download_and_render():
         local_paths = download_sources(
             {s.source_id: remote_background_files.get(s.source_id) for s in spec.sources},
-            TEMP_NC_DIR, "temp_bg_", f"Fundo {background_key} {background_dt.strftime('%H:%M')} UTC",
+            TEMP_DIR, "temp_bg_", f"Background {background_key} {background_dt.strftime('%H:%M')} UTC",
         )
         if local_paths is None:
             return None
         try:
             return pipeline.render_layer(spec, local_paths, config, colors_config, map_geo, background_dt)
         except Exception as e:
-            log_error(f"Falha ao processar o fundo {background_key}: {e}")
+            log_error(f"Failed to process background {background_key}: {e}")
             return None
         finally:
             for path in local_paths.values():
@@ -347,7 +345,7 @@ def resolve_background_layer(target_dt, glm_cfg, remote_background_files, config
     palette_repr = repr(sorted(registry.palette_snapshot(background_key, colors_config).items()))
     colors_fp = hashlib.sha1(palette_repr.encode("utf-8")).hexdigest()[:8]
     cache_base = os.path.join(
-        GLM_NC_CACHE_DIR,
+        TEMP_DIR,
         f"bg_{sat_bucket}_{background_key}_{background_dt.strftime('%Y%j%H%M')}_{geo_fp}_{colors_fp}",
     )
     cache_data_path, lock_path = f"{cache_base}.npz", f"{cache_base}.lock"
@@ -359,14 +357,13 @@ def resolve_background_layer(target_dt, glm_cfg, remote_background_files, config
         try:
             return _load_from_cache(), background_dt
         except Exception as e:
-            log_warning(f"Cache do fundo {background_key} corrompido, regenerando: {e}")
+            log_warning(f"Cache for background {background_key} is corrupted, regenerating: {e}")
 
-    os.makedirs(GLM_NC_CACHE_DIR, exist_ok=True)
     got_lock = acquire_file_lock(lock_path)
     if not got_lock:
         log_warning(
-            f"Timeout esperando o fundo {background_key} de {background_dt.strftime('%H:%M')} UTC "
-            "ser renderizado por outro worker. Gerando sem fundo neste frame."
+            f"Timed out waiting for background {background_key} of {background_dt.strftime('%H:%M')} UTC "
+            "to be rendered by another worker. Generating this frame without a background."
         )
         return None, background_dt
     try:
@@ -374,17 +371,17 @@ def resolve_background_layer(target_dt, glm_cfg, remote_background_files, config
             try:
                 return _load_from_cache(), background_dt
             except Exception as e:
-                log_warning(f"Cache do fundo {background_key} corrompido, regenerando: {e}")
+                log_warning(f"Cache for background {background_key} is corrupted, regenerating: {e}")
         log_info(
-            f"Fundo {background_key} de {background_dt.strftime('%H:%M')} UTC ainda não está em cache. "
-            "Processando uma única vez para todo o bloco de 10 minutos."
+            f"Background {background_key} of {background_dt.strftime('%H:%M')} UTC is not cached yet. "
+            "Processing it once for the whole 10-minute block."
         )
         layer = _download_and_render()
         if layer is not None:
             try:
                 save_background_layer(cache_data_path, layer)
             except Exception as e:
-                log_warning(f"Falha ao salvar o cache do fundo {background_key}: {e}")
+                log_warning(f"Failed to save the cache for background {background_key}: {e}")
         return layer, background_dt
     finally:
         release_file_lock(lock_path)
@@ -444,21 +441,21 @@ def generate_image(local_path, image_path, sat_name, pretty_time, config, colors
         else:
             pipeline.add_geo_features(ax, style)
             if glm_cfg["background"]:
-                log_warning(f"Prosseguindo sem o fundo {glm_cfg['background']} neste frame ({pretty_time}).")
+                log_warning(f"Continuing without background {glm_cfg['background']} for this frame ({pretty_time}).")
 
         if glm_cfg["render_mode"] == "DENSITY":
             flash_count = _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, style,
                                         colorbar_slot=int(reserve_background_colorbar))
-            title_kind = f"Densidade de Raios, {flash_count} raios ({target_dt.strftime('%H:%M:%S')} UTC)"
+            title_kind = f"Lightning Density, {flash_count} flashes ({target_dt.strftime('%H:%M:%S')} UTC)"
         else:
             title_kind = _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_cfg, style)
 
         if glm_cfg["background"] and background_layer is not None:
             title_text = (f"{sat_name} | GLM — {title_kind} | "
                           f"{glm_cfg['background']} ({background_dt.strftime('%H:%M')} UTC) | "
-                          f"{target_dt.strftime('%d/%m/%Y')}")
+                          f"{target_dt.strftime('%Y-%m-%d')}")
         else:
-            title_text = f"{sat_name} | GLM — {title_kind} | {target_dt.strftime('%d/%m/%Y')}"
+            title_text = f"{sat_name} | GLM — {title_kind} | {target_dt.strftime('%Y-%m-%d')}"
         pipeline.add_watermark_and_title(ax, title_ax, style, title_text)
     except Exception:
         plt.close(fig)
@@ -492,7 +489,7 @@ def _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_c
     if show_flash_age and sorted_colors:
         sat_bucket, _ = get_satellite_info(target_dt)
         history = _fetch_flash_history(
-            target_dt, sat_bucket, GLM_NC_CACHE_DIR, max_lookback_steps, max_concurrent_history
+            target_dt, sat_bucket, TEMP_DIR, max_lookback_steps, max_concurrent_history
         )
         for age_seconds, lons, lats in history:
             plot_lons.extend(lons)
@@ -516,14 +513,13 @@ def _draw_points(ax, all_lons, all_lats, target_dt, config, colors_config, glm_c
                 label = f"{limit / 60:.1f}–{next_limit / 60:.1f} min"
             else:
                 label = f"≥ {limit / 60:.1f} min"
-            label = label.replace(".", ",")
             legend_patches.append(mpatches.Patch(color=hex_color, label=label))
 
         legend = ax.legend(handles=legend_patches, loc="lower left", facecolor="black",
                             edgecolor="white", labelcolor="white", fontsize=12)
         legend.set_zorder(6)
 
-    return f"{len(all_lons)} raios ({target_dt.strftime('%H:%M:%S')} UTC)"
+    return f"{len(all_lons)} flashes ({target_dt.strftime('%H:%M:%S')} UTC)"
 
 
 def _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, style, colorbar_slot):
@@ -544,7 +540,7 @@ def _draw_density(ax, fig, all_lons, all_lats, map_geo, glm_cfg, colors_config, 
         ticks = np.arange(vmin, vmax + 1, tick_step)
         colorbar = plt.colorbar(mesh, cax=cax, orientation="vertical", ticks=ticks)
         colorbar.ax.set_yticklabels([f"{int(t)}" for t in ticks], color="white", size=10)
-        colorbar.set_label("raios / célula", color="white", size=10)
+        colorbar.set_label("flashes / cell", color="white", size=10)
         colorbar.outline.set_edgecolor("white")
 
     return len(all_lons)

@@ -1,82 +1,83 @@
 # GOES Image Generator
 
-Gera imagens e vídeos a partir dos satélites GOES-16/GOES-19, focado na América do Sul. Baixa os NetCDF direto do bucket público da NOAA na AWS (acesso anônimo, sem credenciais), recorta a região configurada, aplica as paletas/receitas de `colors.ini` e renderiza com matplotlib/cartopy. Dá pra gerar uma imagem única, montar um vídeo com FFmpeg ou só uma sequência de imagens de um período, sem vídeo. O formato das imagens exportadas (png, webp, jpg ou tiff) é escolhido em `image_format`.
+Generates images and videos from the GOES-16/GOES-19 satellites, focused on South America. It downloads the NetCDF files straight from NOAA's public AWS bucket (anonymous access, no credentials), crops the configured region, applies the palettes/recipes from `colors.ini` and renders everything with matplotlib/cartopy. You can generate a single image, assemble a video with FFmpeg, or just export an image sequence for a period, with no video. The exported image format (png, webp, jpg or tiff) is chosen with `image_format`.
 
-Toda a configuração (produto, período, mapa, cores, performance) fica em `config.ini` e `colors.ini`, com explicações sobre todos os parâmetros. Esse README cobre o que os `.ini` não explicam: a arquitetura por trás de `product =`.
+All configuration (product, period, map, colors, performance) lives in `config.ini` and `colors.ini`, with explanations for every parameter. This README covers what the `.ini` files do not explain: the architecture behind `product =`.
 
 ---
 
-## O que o projeto suporta
+## What the project supports
 
-Bandas ABI individuais: `C01` a `C16`. C01-C06 (refletância) saem em cinza; C07-C16 usam a paleta em `[PALETTE_C07..16]`.
+Individual ABI bands: `C01` to `C16`. C01-C06 (reflectance) are rendered in grayscale; C07-C16 use the palette in `[PALETTE_C07..16]`.
 
-Multiespectrais: `GEOCOLOR` (aproximação true-color/IR do produto CIRA GeoColor) e `SPLIT_WINDOW` (C13 - C15).
+Multispectral: `GEOCOLOR` (true-color/IR approximation of the CIRA GeoColor product) and `SPLIT_WINDOW` (C13 - C15).
 
-Composições RGB: `AIRMASS`, `DAY_CLOUD_PHASE`, `NIGHT_MICROPHYSICS`, `SEVERE_STORMS`, `OVERSHOOTING_TOPS`, `FIRE_TEMPERATURE`. Cada uma é uma receita em `colors.ini` (faixa física, gama e inversão são livres; as bandas só podem variar entre as que o produto já baixa, lista no topo da seção RGB de `colors.ini`), não código fixo.
+RGB composites: `AIRMASS`, `DAY_CLOUD_PHASE`, `NIGHT_MICROPHYSICS`, `SEVERE_STORMS`, `OVERSHOOTING_TOPS`, `FIRE_TEMPERATURE`. Each one is a recipe in `colors.ini` (physical range, gamma and inversion are free; the bands can only vary among those the product already downloads, listed at the top of the RGB section of `colors.ini`), not hardcoded.
 
-Produtos de nuvem: `CLOUD_TOP_HEIGHT` (produto oficial `ABI-L2-ACHAF`) e `CLOUD_BASE_HEIGHT`/`CLOUD_THICKNESS`, que são estimativas deste projeto (veja o aviso em `colors.ini` e "Limitações conhecidas" abaixo).
+Cloud products: `CLOUD_TOP_HEIGHT` (official `ABI-L2-ACHAF` product) and `CLOUD_BASE_HEIGHT`/`CLOUD_THICKNESS`, which are estimates made by this project (see the warning in `colors.ini` and "Known limitations" below).
 
-GLM: `product = GLM`, configurado na seção `[GLM]` de `config.ini`. Dois modos (`render_mode`): `POINTS` (raios individuais, cor/tamanho por idade) e `DENSITY` (grade 2D de contagem de raios). Nos dois modos, `[GLM] background` aceita qualquer produto da lista acima como plano de fundo, inclusive outra composição RGB, o GEOCOLOR ou um produto de nuvem. Quando o fundo tem barra de cores (bandas térmicas, SPLIT_WINDOW e produtos de nuvem), ela sai à direita do mapa. Com `background` vazio o PNG sai com fundo transparente de verdade (canal alpha), em qualquer `render_mode`, com ou sem `clean_mode` e `hide_map_lines`. Em vídeo isso não se mantém: o MP4 não tem canal alpha e mostra o fundo preto. Para ter os frames transparentes, use `generation_type = S` (sequência de imagens, PNGs direto em `satelite_images/`) ou `generation_type = I`.
+GLM: `product = GLM`, configured in the `[GLM]` section of `config.ini`. Two modes (`render_mode`): `POINTS` (individual flashes, color/size by age) and `DENSITY` (2D grid of flash counts). In both modes, `[GLM] background` accepts any product from the list above as the background layer, including another RGB composite, GEOCOLOR or a cloud product. When the background has a colorbar (thermal bands, SPLIT_WINDOW and cloud products), it is drawn to the right of the map. With an empty `background`, the PNG has a truly transparent background (alpha channel), in any `render_mode`, with or without `clean_mode` and `hide_map_lines`. This does not carry over to video: the MP4 has no alpha channel and shows a black background. To get transparent frames, use `generation_type = S` (image sequence, PNGs saved in their own folder inside `output/`) or `generation_type = I`.
 
-Só existem imagens ABI "Full Disk" (disco completo) a cada 10 minutos, modo de escaneamento 6 (GOES-16 só passou a esse modo em abril/2019; CONUS e mesoescala não são suportados). GLM (`GLM-L2-LCFA`) tem um arquivo a cada 20 segundos. Troca automática de satélite: antes de 2025-04-07 15:10 UTC usa o GOES-16; a partir daí, o GOES-19.
+Only ABI "Full Disk" images exist, every 10 minutes, scan mode 6 (GOES-16 only switched to this mode in April 2019; CONUS and mesoscale are not supported). GLM (`GLM-L2-LCFA`) has one file every 20 seconds. Automatic satellite switch: before 2025-04-07 15:10 UTC it uses GOES-16; from then on, GOES-19.
 
-### Produtos e arquivos que cada um baixa
+### Products and the files each one downloads
 
-Cada frame baixa os NetCDF listados abaixo (um por linha da coluna "Arquivos"). Quanto mais arquivos, mais RAM e rede por worker, então ajuste `num_workers` olhando esta tabela.
+Each frame downloads the NetCDF files listed below (one per line of the "Files" column). The more files, the more RAM and network per worker, so tune `num_workers` by looking at this table.
 
-| `product =` | Arquivos por frame | Quando faz sentido |
+| `product =` | Files per frame | When it makes sense |
 |---|---|---|
-| `C01` a `C06` | 1 banda ABI (`CMIPF`) | Só de dia (refletância) |
-| `C07` a `C16` | 1 banda ABI (`CMIPF`) | Dia e noite (C07 tem reflexo solar de dia) |
-| `SPLIT_WINDOW` | C13, C15 | Dia e noite |
-| `AIRMASS` | C08, C10, C12, C13 | Dia e noite |
-| `DAY_CLOUD_PHASE` | C02, C05, C13 | Só de dia |
-| `NIGHT_MICROPHYSICS` | C07, C13, C15 | Feito pra noite |
-| `SEVERE_STORMS` | C02, C05, C07, C08, C10, C13 | Só de dia |
-| `OVERSHOOTING_TOPS` | C08, C12, C13 | Dia e noite |
-| `FIRE_TEMPERATURE` | C05, C06, C07 | Dia |
-| `GEOCOLOR` | C01, C02, C03, C13 | Dia e noite (transição pelo ângulo solar) |
-| `CLOUD_TOP_HEIGHT` | `ACHAF` | Dia e noite |
-| `CLOUD_BASE_HEIGHT`, `CLOUD_THICKNESS` | `ACHAF`, `CODF`, `ACTPF` | Dia e noite, mas é estimativa e à noite o COD só é confiável de 1 a 8 |
-| `GLM` | 1 arquivo GLM (20 s) + histórico se `POINTS` com `flash_age = True` + os arquivos do fundo escolhido | Dia e noite |
+| `C01` to `C06` | 1 ABI band (`CMIPF`) | Daytime only (reflectance) |
+| `C07` to `C16` | 1 ABI band (`CMIPF`) | Day and night (C07 has solar reflection by day) |
+| `SPLIT_WINDOW` | C13, C15 | Day and night |
+| `AIRMASS` | C08, C10, C12, C13 | Day and night |
+| `DAY_CLOUD_PHASE` | C02, C05, C13 | Daytime only |
+| `NIGHT_MICROPHYSICS` | C07, C13, C15 | Designed for night |
+| `SEVERE_STORMS` | C02, C05, C07, C08, C10, C13 | Daytime only |
+| `OVERSHOOTING_TOPS` | C08, C12, C13 | Day and night |
+| `FIRE_TEMPERATURE` | C05, C06, C07 | Daytime |
+| `GEOCOLOR` | C01, C02, C03, C13 | Day and night (transition by solar angle) |
+| `CLOUD_TOP_HEIGHT` | `ACHAF` | Day and night |
+| `CLOUD_BASE_HEIGHT`, `CLOUD_THICKNESS` | `ACHAF`, `CODF`, `ACTPF` | Day and night, but it is an estimate and at night COD is only reliable from 1 to 8 |
+| `GLM` | 1 GLM file (20 s) + history if `POINTS` with `flash_age = True` + the files of the chosen background | Day and night |
 
 ---
 
-### Exemplos de renderização
+### Rendering examples
+
+https://github.com/user-attachments/assets/0e942493-5555-4248-ba88-c960e7482369
 
 <p align="center">
-  <img src="assets/animacao_ir.gif" alt="Animação em modo vídeo" width="100%"><br>
-  <small><i>Modo vídeo (C13, infravermelho)</i></small>
+  <small><i>Video mode (C13, infrared, downscaled for GitHub)</i></small>
 </p>
 
 <table border="0" width="100%">
   <tr>
     <td align="center" width="50%">
-      <img src="assets/geocolor.png" alt="GeoColor" width="100%"><br>
-      <small><i>GEOCOLOR (true-color de dia, IR à noite)</i></small>
+      <img src="assets/geocolor.webp" alt="GeoColor" width="100%"><br>
+      <small><i>GEOCOLOR (true-color by day, IR at night)</i></small>
     </td>
     <td align="center" width="50%">
-      <img src="assets/airmass.png" alt="Airmass RGB" width="100%"><br>
-      <small><i>AIRMASS (composição RGB)</i></small>
+      <img src="assets/airmass.webp" alt="Airmass RGB" width="100%"><br>
+      <small><i>AIRMASS (RGB composite)</i></small>
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="assets/severe_storms.png" alt="Severe Storms RGB" width="100%"><br>
-      <small><i>SEVERE_STORMS (composição RGB)</i></small>
+      <img src="assets/severe_storms.webp" alt="Severe Storms RGB" width="100%"><br>
+      <small><i>SEVERE_STORMS (RGB composite)</i></small>
     </td>
     <td align="center" width="50%">
-      <img src="assets/c02_glmpoints.png" alt="Banda 2 com GLM" width="100%"><br>
-      <small><i>C02 (visível) com GLM por cima</i></small>
+      <img src="assets/c02_glmpoints.webp" alt="Band 2 with GLM" width="100%"><br>
+      <small><i>C02 (visible) with GLM on top</i></small>
     </td>
   </tr>
 </table>
 
 ---
 
-## Instalando
+## Installing
 
-Python 3.10+. Cartopy precisa de GEOS/PROJ instalados no sistema, então o caminho mais tranquilo é usar Conda:
+Python 3.10+. Cartopy needs GEOS/PROJ installed on the system, so the smoothest route is Conda:
 
 ```bash
 git clone https://github.com/ArthurPH25/goes-image-generator.git
@@ -87,100 +88,103 @@ conda install -c conda-forge cartopy
 pip install -r requirements.txt
 ```
 
-Pip puro também funciona, mas instalar o Cartopy vira um problema à parte dependendo do sistema operacional. Resolve GEOS/PROJ antes de rodar o `pip install`.
+Plain pip also works, but installing Cartopy becomes a problem of its own depending on the operating system. Sort out GEOS/PROJ before running `pip install`.
 
-O FFmpeg não precisa estar instalado nem no PATH (`imageio-ffmpeg` traz o binário). Em servidor, use `open_video_when_done = False`. A primeira execução precisa de internet pro Cartopy baixar os dados de fronteiras/costa (Natural Earth); nas seguintes já está em cache local. Com `hide_map_lines = True` esse download nem é feito.
+FFmpeg does not need to be installed or on the PATH (`imageio-ffmpeg` ships the binary). On a server, use `open_video_when_done = False`. The first run needs internet access so Cartopy can download the borders/coastline data (Natural Earth); subsequent runs use the local cache. With `hide_map_lines = True` that download is not even made.
 
-Ajuste `config.ini` (produto, data/hora, coordenadas, performance) e `colors.ini` (paletas/receitas) na raiz do projeto e rode:
+Adjust `config.ini` (product, date/time, coordinates, performance) and `colors.ini` (palettes/recipes) in the project root and run:
 
 ```bash
-python index.py
+python main.py
 ```
 
-Roda de qualquer diretório: os dois `.ini` são lidos da pasta do script. Valida tudo antes de baixar qualquer coisa.
+It runs from any directory: both `.ini` files are read from the script's folder. Everything is validated before anything is downloaded.
 
-## Arquitetura: como um produto vira uma imagem
+## Architecture: how a product becomes an image
 
 ```
 config.ini [GENERAL] product = X
         │
         ▼
-products/registry.py    sabe quais arquivos X precisa do bucket da NOAA
-        │               (SourceSpec) e qual função sabe desenhá-lo (renderer)
-        ▼
-index.py                lista e baixa esses arquivos para o timestamp certo
+products/registry.py    knows which files X needs from the NOAA bucket
+        │               (SourceSpec) and which function knows how to draw it
+        ▼               (renderer)
+main.py                 lists and downloads those files for the right timestamp
         │
         ▼
-products/<módulo>.py    lê o(s) NetCDF e devolve um LayerResult padronizado
-   (abi / clavr)        (kind="mono": array 2D + colormap; kind="rgb":
-        │               array (H,W,3) já pronto)
+products/<module>.py    reads the NetCDF file(s) and returns a standardized
+   (abi / clavr)        LayerResult (kind="mono": 2D array + colormap;
+        │               kind="rgb": ready-made (H,W,3) array)
         ▼
-products/pipeline.py    desenha o LayerResult nos eixos do mapa, com
-                        linhas, colorbar e título quando aplicável, e a
-                        marca d'água sempre que `watermark` não for vazio,
-                        e salva a imagem no formato de image_format
+products/pipeline.py    draws the LayerResult on the map axes, with lines,
+                        colorbar and title where applicable, and the
+                        watermark whenever `watermark` is not empty, and
+                        saves the image in the image_format format
 ```
 
-Módulos de `products/`: `core.py` (geometria da projeção, recorte, reamostragem, `LayerResult`), `abi.py` (leitura das bandas ABI, bandas individuais, SPLIT_WINDOW, composições RGB e GEOCOLOR), `clavr.py` (produtos de nuvem), `pipeline.py` (desenho comum), `registry.py` (mapa produto, fontes e renderer) e `glm.py` (relâmpagos).
+Modules in `products/`: `core.py` (projection geometry, cropping, resampling, `LayerResult`), `abi.py` (ABI band reading, individual bands, SPLIT_WINDOW, RGB composites and GEOCOLOR), `clavr.py` (cloud products), `pipeline.py` (shared drawing), `registry.py` (product, sources and renderer map) and `glm.py` (lightning).
 
-`products/glm.py` não passa por `pipeline.generate_standalone_image`: ele tem fluxo próprio (`GLM.generate_image`) porque desenha pontos/grade *por cima* de um fundo opcional. Esse fundo é resolvido pela mesma `pipeline.render_layer()` usada por qualquer outro produto, e é por isso que o GLM aceita qualquer coisa como fundo sem duplicar lógica de desenho.
+`products/glm.py` does not go through `pipeline.generate_standalone_image`: it has its own flow (`GLM.generate_image`) because it draws points/grid *on top of* an optional background. That background is resolved by the same `pipeline.render_layer()` used by every other product, which is why GLM accepts anything as a background without duplicating drawing logic.
 
-Bandas ABI de resoluções nativas diferentes (0.5/1/2 km) aparecem juntas em várias composições RGB e no GEOCOLOR. `products/core.py::align_bands_to_reference` reamostra todas pra grade da banda mais grosseira da receita, por vizinho mais próximo em coordenadas de scan angle (não por índice de pixel), então o alinhamento geográfico se mantém mesmo com margens de recorte ligeiramente diferentes entre arquivos.
+ABI bands of different native resolutions (0.5/1/2 km) appear together in several RGB composites and in GEOCOLOR. `products/core.py::align_bands_to_reference` resamples them all to the grid of the coarsest band in the recipe, by nearest neighbor in scan-angle coordinates (not by pixel index), so geographic alignment holds even with slightly different crop margins between files.
 
-Adicionar um produto novo = 4 passos: (1) escrever um `render(nc_paths, config, colors_config, map_geo, product_spec, target_dt) -> LayerResult` num módulo de `products/`; (2) registrar em `products/registry.py::build_registry()` com suas `SourceSpec` (se o `kind` for novo, inclua também um ramo em `validate_product_colors` e, se ele puder ser fundo do GLM, em `_rebuild_cmap_for_background` de `products/glm.py`); (3) adicionar a seção de paleta/receita correspondente em `colors.ini`; (4) acrescentar o nome do produto na lista de valores aceitos nos comentários de `[GENERAL]` em `config.ini`. Não precisa tocar em `index.py` nem em `pipeline.py`.
+Adding a new product = 4 steps: (1) write a `render(nc_paths, config, colors_config, map_geo, product_spec, target_dt) -> LayerResult` in a `products/` module; (2) register it in `products/registry.py::build_registry()` with its `SourceSpec`s (if the `kind` is new, also add a branch in `validate_product_colors` and, if it can be a GLM background, in `_rebuild_cmap_for_background` in `products/glm.py`); (3) add the matching palette/recipe section in `colors.ini`; (4) add the product name to the list of accepted values in the `[GENERAL]` comments in `config.ini`. There is no need to touch `main.py` or `pipeline.py`.
 
-## Limitações conhecidas (leia antes de usar em produção)
+## Known limitations (read before using in production)
 
-- GEOCOLOR é uma aproximação: true-color sintético de dia (o GOES não tem banda verde real, então o verde é uma combinação de C01/C02/C03) e IR realçado à noite, com transição pelo ângulo zenital solar calculado localmente. Não tem o mosaico de luzes noturnas nem o realce de neve/gelo do produto oficial do CIRA.
-- CLOUD_BASE_HEIGHT e CLOUD_THICKNESS são estimativas, não um produto público oficial (esse produto não existe no bucket da NOAA, e o que o CIRA/SLIDER mostra sai de um pipeline à parte). Aqui a espessura vem de uma parametrização simples em cima de `COD` (profundidade óptica, `ABI-L2-CODF`) e `Phase` (`ABI-L2-ACTPF`), com coeficientes editáveis em `colors.ini [ESTIMATE_CLOUD_GEOMETRY]`. Use só como visualização experimental.
-- As receitas das composições RGB (`RGB_AIRMASS`, `RGB_SEVERE_STORMS` etc. em `colors.ini`) seguem os quick guides públicos da NOAA/CIRA para o ABI e da EUMETSAT, com uma exceção: `OVERSHOOTING_TOPS` não tem guia publicado com esses números, é uma receita experimental inspirada no Tropical Airmass (detalhes em `colors.ini`). O `SEVERE_STORMS` segue a receita Severe Storms da EUMETSAT, com gama 0,5 no verde; o Day Convection da NOAA tem as mesmas faixas, mas gama 1 no verde. A gama segue a convenção EUMETSAT/CIRA, saída = valor ^ (1 / gama). Se notar diferença contra uma imagem de referência confiável, ajuste `min`/`max`/`gamma` sem mexer em código.
+- GEOCOLOR is an approximation: synthetic true-color by day (GOES has no real green band, so green is a combination of C01/C02/C03) and enhanced IR at night, with a transition based on the solar zenith angle computed locally. It has neither the night lights mosaic nor the snow/ice enhancement of the official CIRA product.
+- CLOUD_BASE_HEIGHT and CLOUD_THICKNESS are estimates, not an official public product (that product does not exist in the NOAA bucket, and what CIRA/SLIDER shows comes from a separate pipeline). Here, thickness comes from a simple parameterization on top of `COD` (optical depth, `ABI-L2-CODF`) and `Phase` (`ABI-L2-ACTPF`), with coefficients editable in `colors.ini [ESTIMATE_CLOUD_GEOMETRY]`. Use only as an experimental visualization.
+- The RGB composite recipes (`RGB_AIRMASS`, `RGB_SEVERE_STORMS`, etc. in `colors.ini`) follow the public NOAA/CIRA quick guides for ABI and the EUMETSAT ones, with one exception: `OVERSHOOTING_TOPS` has no published guide with these numbers, it is an experimental recipe inspired by the Tropical Airmass (details in `colors.ini`). `SEVERE_STORMS` follows EUMETSAT's Severe Storms recipe, with gamma 0.5 on green; NOAA's Day Convection has the same ranges but gamma 1 on green. Gamma follows the EUMETSAT/CIRA convention, output = value ^ (1 / gamma). If you notice a difference against a trusted reference image, adjust `min`/`max`/`gamma` without touching any code.
 
-## Como funciona por dentro (detalhes de execução)
+## How it works internally (execution details)
 
-A validação de `config.ini`/`colors.ini` roda logo no início do `index.py`, antes de qualquer coisa tocar rede. Nessa etapa também é calculada a `render_signature`, um SHA1 de 12 caracteres com tudo que muda a aparência do frame: produto, `[MAP]`, `[STYLE]` inteiro, dpi, e as seções de `colors.ini` relevantes pro produto ativo (incluindo, no caso do GLM, as do produto de fundo). Data e horário ficam de fora de propósito.
+The validation of `config.ini`/`colors.ini` runs right at the start of `main.py`, before anything touches the network. This step also computes the `render_signature`, a 12-character SHA1 of everything that changes a frame's appearance: product, `[MAP]`, the whole `[STYLE]`, dpi, and the `colors.ini` sections relevant to the active product (including, in the GLM case, those of the background product). Date and time are deliberately left out.
 
-Essa assinatura define a pasta `satelite_temp_images/<assinatura>/` no modo vídeo. Mudar só o período reaproveita frames já renderizados; mudar qualquer coisa visual gera pasta nova.
+That signature is part of the name of the video frames in `temp/` (`frame_<signature>_*.png`). The frames are deleted as soon as the video is assembled. If a video run dies before that, the next run with the same visual settings reuses the frames already rendered and continues from there. Changing anything visual changes the signature, so stale frames are never reused. Frames from an abandoned configuration stay in `temp/` until a video with that same signature succeeds, or until you delete them by hand.
 
-A busca no S3 roda sequencial, fora dos processos de renderização, uma listagem por hora de dados (e por fonte, quando o produto pede mais de um arquivo: RGBs, nuvem ou GLM com fundo). A renderização distribui cada timestamp entre `num_workers` processos separados; cada worker baixa os arquivos que o produto daquele frame precisa.
+The S3 search runs sequentially, outside the rendering processes, one listing per hour of data (and per source, when the product needs more than one file: RGBs, cloud or GLM with a background). Rendering distributes each timestamp across `num_workers` separate processes; each worker downloads the files the product needs for that frame.
 
-Fundo do GLM em modo vídeo ou sequência de imagens: renderizado (não só baixado) uma única vez por bloco de 10 minutos e guardado em cache (`satelite_temp_downloads/glm_nc_cache/bg_*.npz`), reaproveitado pelos ~30 frames de 20s daquele bloco. A trava (`.lock`) tem limite de 5 min; se estourar, o frame sai sem fundo com aviso.
+GLM background in video or image sequence mode: rendered (not just downloaded) once per 10-minute block and kept in a cache (`temp/bg_*.npz`), reused by the ~30 20 s frames of that block. The lock (`.lock`) has a 5 min limit; if it is exceeded, the frame is produced without a background and a warning is shown.
 
-Demais comportamentos de borda (satélite ausente no bucket, PNG corrompido, trava de instância única, limpeza de pastas temporárias) seguem exatamente como documentado nos comentários de `config.ini`.
+Other edge-case behaviors (satellite missing from the bucket, corrupted PNG, single-instance lock, cleanup of temporary files) work exactly as documented in the comments of `config.ini`.
 
-## Pastas de saída
+## Folders
 
-| Pasta | Conteúdo | Sobrevive entre execuções? |
+Only two, both created next to `main.py` when needed.
+
+| Path | Contents | Survives between runs? |
 |---|---|---|
-| `satelite_images/` | Imagens do modo imagem única (`<PRODUTO>_<timestamp>.<ext>`, ext conforme `image_format`) | Sim, nunca sobrescreve |
-| `satelite_images/<PRODUTO>_<início>_a_<fim>/` | Imagens do modo sequência (`<PRODUTO>_<AAAAMMDD>_<HHMM>.<ext>`, GLM com segundos) | Sim, cada execução cria uma pasta nova |
-| `satelite_videos/` | MP4s do modo vídeo (`satelite_<PRODUTO>_<início>_a_<fim>.mp4`) | Sim |
-| `satelite_temp_images/<assinatura>/` | Frames do modo vídeo (sempre PNG) | Só se `delete_temp_images = False` |
-| `satelite_temp_downloads/` | NetCDF baixados na execução | Não |
-| `satelite_temp_downloads/glm_nc_cache/` | Histórico do GLM + cache de fundo (`.npz`) | Não |
-| `satelite_temp_downloads/instance.lock` | Trava de execução única | Não, expira em 24h se sobrar |
+| `output/<PRODUCT>_<timestamp>.<ext>` | Single image mode (ext according to `image_format`) | Yes, never overwrites |
+| `output/<PRODUCT>_<start>_to_<end>/` | Image sequence mode (`<PRODUCT>_<YYYYMMDD>_<HHMM>.<ext>`, GLM with seconds) | Yes, each run creates a new folder |
+| `output/<PRODUCT>_<start>_to_<end>.mp4` | Video mode | Yes, never overwrites |
+| `temp/frame_<signature>_*.png` | Video mode frames (always PNG) | Only if the video run dies before the video is assembled |
+| `temp/instance.lock` | Single-instance lock | No, expires after 24h if left behind |
+| `temp/` (everything else) | Downloaded NetCDF files, GLM history and background cache (`.npz`) | No |
 
-## Solução de problemas comuns
+`temp/` has no subfolders. At the end of each run everything in it is deleted, except the lock while the run is active and the frames of an unfinished video run, and the folder itself is removed when nothing is left. `output/` is also removed if the run produced nothing.
 
-| Sintoma | O que fazer |
+## Troubleshooting
+
+| Symptom | What to do |
 |---|---|
-| Erro de validação logo no início | Leia a mensagem: ela aponta a chave do `.ini`. Confira `product` contra a lista em `[GENERAL]`, formato do horário (`HH:MM` vs `HH:MM:SS` no GLM) e comentário na mesma linha do valor. |
-| "fonte(s) não encontrada(s) no bucket" | Um dos arquivos que o produto escolhido precisa (banda ABI ou `ACHAF`/`CODF`/`ACTPF`) não existe pra esse instante. Confira data/hora em UTC e se o período é suportado. |
-| "Já existe outra execução..." | Apague `satelite_temp_downloads/instance.lock` se tiver certeza de que não há execução ativa. |
-| GLM sem `background` sai com fundo preto no vídeo | É o MP4, que não tem transparência. Os PNGs continuam transparentes: use `generation_type = S` para recebê-los direto em `satelite_images/<PRODUTO>_.../`. |
-| GLM com fundo sempre "sem fundo" | Confira `[GLM] background` contra a lista de produtos válidos e se esse produto tem paleta/receita completa em `colors.ini`. |
-| Vídeo GLM com frames "sem fundo" às vezes | Muitos workers disputando o mesmo cache de fundo. Reduza `num_workers`. |
-| O processo morre sozinho no meio | Falta de RAM. Reduza `num_workers` primeiro (produtos com várias bandas/fontes pesam mais), depois `dpi`/`figure_width`/`figure_height`. |
-| Cores de uma composição RGB/GeoColor parecem erradas | Ajuste `min`/`max`/`gamma`/`invert` da seção `[RGB_*]` correspondente em `colors.ini`. São só números, não precisa mexer em código. Gama abaixo de 1 escurece, acima de 1 clareia. |
-| Erro de validação dizendo que a receita usa banda que o produto "não baixa" | Você trocou uma banda da receita por outra que o produto não baixa. Use uma das bandas listadas em `colors.ini` para aquele produto ou inclua a nova banda nas fontes dele em `products/registry.py`. |
-| Erro dizendo que `target_coordinates` está fora do disco visível | O recorte está numa região que o GOES-East não enxerga (ele cobre de uns -156 a 6 de longitude). Revise `[MAP] target_coordinates`. |
-| A imagem sai com horário diferente do esperado | Todos os horários do `config.ini` são UTC. Horário de Brasília é UTC-3, então 16:30 em Brasília é `19:30` no arquivo. |
+| Validation error right at the start | Read the message: it points to the `.ini` key. Check `product` against the list in `[GENERAL]`, the time format (`HH:MM` vs `HH:MM:SS` for GLM) and any comment on the same line as a value. |
+| "File(s) ... not found in the bucket" or "No files found for the configured dates" | One of the files the chosen product needs (ABI band or `ACHAF`/`CODF`/`ACTPF`) does not exist for that instant. Check the date/time in UTC and whether the period is supported. |
+| "Another run of this script is already in progress..." | Delete `temp/instance.lock` if you are sure no run is active. |
+| GLM without `background` comes out with a black background in the video | That is the MP4, which has no transparency. The PNGs are still transparent: use `generation_type = S` to get them directly in `output/<PRODUCT>_.../`. |
+| GLM background always "without background" | Check `[GLM] background` against the list of valid products and whether that product has a complete palette/recipe in `colors.ini`. |
+| GLM video with occasional "no background" frames | Too many workers competing for the same background cache. Reduce `num_workers`. |
+| The process dies on its own midway | Out of RAM. Reduce `num_workers` first (products with several bands/sources weigh more), then `dpi`/`figure_width`/`figure_height`. |
+| Colors of an RGB composite/GeoColor look wrong | Adjust `min`/`max`/`gamma`/`invert` in the matching `[RGB_*]` section of `colors.ini`. They are just numbers, no code changes needed. Gamma below 1 darkens, above 1 brightens. |
+| Validation error saying the recipe uses a band the product "does not download" | You swapped a recipe band for another one the product does not download. Use one of the bands listed in `colors.ini` for that product or add the new band to its sources in `products/registry.py`. |
+| Error saying `target_coordinates` is outside the visible disk | The crop is in a region GOES-East cannot see (it covers roughly longitudes -156 to 6). Review `[MAP] target_coordinates`. |
+| The image shows a different time than expected | All `config.ini` times are UTC. Brasília time is UTC-3, so 16:30 in Brasília is `19:30` in the file. |
 
-## Créditos
+## Credits
 
-- Dados: satélites GOES-R da NOAA/NASA, via [NOAA Open Data Dissemination na AWS](https://registry.opendata.aws/noaa-goes/) (buckets `noaa-goes16` e `noaa-goes19`).
-- Mapas: [Natural Earth](https://www.naturalearthdata.com/), via Cartopy.
-- Receitas de RGB/GeoColor: quick guides públicos da EUMETSAT, CIMSS e CIRA (ver aviso de precisão em `colors.ini`).
+- Data: NOAA/NASA GOES-R satellites, via [NOAA Open Data Dissemination on AWS](https://registry.opendata.aws/noaa-goes/) (buckets `noaa-goes16` and `noaa-goes19`).
+- Maps: [Natural Earth](https://www.naturalearthdata.com/), via Cartopy.
+- RGB/GeoColor recipes: public quick guides from EUMETSAT, CIMSS and CIRA (see the accuracy note in `colors.ini`).
 
-## Licença
+## License
 
 [MIT](LICENSE).

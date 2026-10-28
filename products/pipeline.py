@@ -216,7 +216,7 @@ def generate_standalone_image(product_spec, nc_paths, sat_name, config, colors_c
         if needs_colorbar:
             draw_colorbar(fig, ax, im, layer)
 
-        title_text = f"{sat_name} | {layer.title_fragment} | {target_dt.strftime('%d/%m/%Y %H:%M')} UTC"
+        title_text = f"{sat_name} | {layer.title_fragment} | {target_dt.strftime('%Y-%m-%d %H:%M')} UTC"
         add_watermark_and_title(ax, title_ax, style, title_text)
     except Exception:
         plt.close(fig)

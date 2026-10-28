@@ -56,12 +56,12 @@ def build_registry():
     )
 
     rgb_products = {
-        "AIRMASS": ("Massa de Ar (Airmass RGB)", (8, 10, 12, 13)),
-        "DAY_CLOUD_PHASE": ("Distinção de Fase de Nuvem Diurna", (2, 5, 13)),
-        "NIGHT_MICROPHYSICS": ("Microfísica Noturna", (7, 13, 15)),
-        "SEVERE_STORMS": ("Tempestades Severas", (2, 5, 7, 8, 10, 13)),
+        "AIRMASS": ("Air Mass (Airmass RGB)", (8, 10, 12, 13)),
+        "DAY_CLOUD_PHASE": ("Day Cloud Phase Distinction", (2, 5, 13)),
+        "NIGHT_MICROPHYSICS": ("Night Microphysics", (7, 13, 15)),
+        "SEVERE_STORMS": ("Severe Storms", (2, 5, 7, 8, 10, 13)),
         "OVERSHOOTING_TOPS": ("Overshooting Tops", (8, 12, 13)),
-        "FIRE_TEMPERATURE": ("Temperatura do Fogo", (5, 6, 7)),
+        "FIRE_TEMPERATURE": ("Fire Temperature", (5, 6, 7)),
     }
     for key, (label, bands) in rgb_products.items():
         registry[key] = ProductSpec(
@@ -76,7 +76,7 @@ def build_registry():
     registry["GEOCOLOR"] = ProductSpec(
         key="GEOCOLOR",
         kind="geocolor",
-        label="GeoColor (aproximação CIRA-like)",
+        label="GeoColor (CIRA-like approximation)",
         sources=(_band_source(1), _band_source(2), _band_source(3), _band_source(13)),
         renderer=abi.render_geocolor,
         palette_section="RGB_GEOCOLOR",
@@ -90,7 +90,7 @@ def build_registry():
     registry["CLOUD_TOP_HEIGHT"] = ProductSpec(
         key="CLOUD_TOP_HEIGHT",
         kind="cloud",
-        label="Altura do Topo da Nuvem",
+        label="Cloud Top Height",
         sources=(cloud_sources[0],),
         renderer=clavr.render_cloud_top_height,
         palette_section="PALETTE_CLOUD_TOP_HEIGHT",
@@ -98,7 +98,7 @@ def build_registry():
     registry["CLOUD_BASE_HEIGHT"] = ProductSpec(
         key="CLOUD_BASE_HEIGHT",
         kind="cloud",
-        label="Altura da Base da Nuvem (estimativa)",
+        label="Cloud Base Height (estimate)",
         sources=cloud_sources,
         renderer=clavr.render_cloud_base_height,
         palette_section="PALETTE_CLOUD_BASE_HEIGHT",
@@ -106,7 +106,7 @@ def build_registry():
     registry["CLOUD_THICKNESS"] = ProductSpec(
         key="CLOUD_THICKNESS",
         kind="cloud",
-        label="Espessura Geométrica da Nuvem (estimativa)",
+        label="Cloud Geometric Thickness (estimate)",
         sources=cloud_sources,
         renderer=clavr.render_cloud_thickness,
         palette_section="PALETTE_CLOUD_THICKNESS",
@@ -115,7 +115,7 @@ def build_registry():
     registry["GLM"] = ProductSpec(
         key="GLM",
         kind="glm",
-        label="GLM (Mapeador de Relâmpagos)",
+        label="GLM (Geostationary Lightning Mapper)",
         sources=(SourceSpec(source_id="GLM", product_code=GLM_PRODUCT),),
         renderer=None,
     )
@@ -142,7 +142,7 @@ def get_product(key):
     registry = get_registry()
     if key not in registry:
         raise ValueError(
-            f"produto '{key}' não reconhecido. Valores aceitos: {', '.join(sorted(registry))}"
+            f"product '{key}' not recognized. Accepted values: {', '.join(sorted(registry))}"
         )
     return registry[key]
 
@@ -157,22 +157,22 @@ def palette_snapshot(product_key, colors_config):
 
 def validate_palette_section(colors_config, section, min_keys=2):
     if not colors_config.has_section(section):
-        raise ValueError(f"seção '[{section}]' ausente em colors.ini")
+        raise ValueError(f"section '[{section}]' missing from colors.ini")
     items = colors_config.items(section)
     if len(items) < min_keys:
         raise ValueError(
-            f"seção '[{section}]' precisa de pelo menos {min_keys} chaves diferentes "
-            f"para interpolar cores, encontrada(s) {len(items)}"
+            f"section '[{section}]' needs at least {min_keys} different keys "
+            f"to interpolate colors, found {len(items)}"
         )
     for key, value in items:
         try:
             int(key)
         except ValueError:
             raise ValueError(
-                f"chave '{key}' na seção '[{section}]' não é um número inteiro válido "
-                "(valores físicos devem ser inteiros, ex: -63, não -63.5)"
+                f"key '{key}' in section '[{section}]' is not a valid integer "
+                "(physical values must be integers, e.g. -63, not -63.5)"
             ) from None
-        validate_color(f"[{section}] chave {key}", value)
+        validate_color(f"[{section}] key {key}", value)
 
 
 def _check_recipe_bands(spec, recipe_bands):
@@ -180,9 +180,9 @@ def _check_recipe_bands(spec, recipe_bands):
     not_downloaded = sorted(recipe_bands - downloaded_bands)
     if not_downloaded:
         raise ValueError(
-            f"[{spec.palette_section}] usa a(s) banda(s) {', '.join(f'C{b:02d}' for b in not_downloaded)}, "
-            f"que {spec.key} não baixa (bandas baixadas: {', '.join(f'C{b:02d}' for b in sorted(downloaded_bands))}). "
-            "Use só essas bandas ou inclua a nova banda nas fontes do produto em products/registry.py"
+            f"[{spec.palette_section}] uses band(s) {', '.join(f'C{b:02d}' for b in not_downloaded)}, "
+            f"which {spec.key} does not download (downloaded bands: {', '.join(f'C{b:02d}' for b in sorted(downloaded_bands))}). "
+            "Use only those bands or add the new band to the product sources in products/registry.py"
         )
 
 
@@ -203,4 +203,4 @@ def validate_product_colors(product_key, colors_config):
         validate_palette_section(colors_config, spec.palette_section)
         clavr.read_estimate_config(colors_config)
     else:
-        raise ValueError(f"tipo de produto não pode ser usado como fundo/validado aqui: '{spec.kind}'")
+        raise ValueError(f"product kind cannot be used as a background / validated here: '{spec.kind}'")
